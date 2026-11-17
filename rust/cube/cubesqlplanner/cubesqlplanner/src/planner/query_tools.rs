@@ -7,8 +7,9 @@ use crate::cube_bridge::sql_templates_render::SqlTemplatesRender;
 use crate::planner::filter::FilterItem;
 use crate::planner::model_context::QueryModelContext;
 use crate::planner::sql_templates::PlanSqlTemplates;
-use chrono_tz::Tz;
+use crate::planner::QueryDateTimeHelper;
 use cubenativeutils::CubeError;
+use jiff::tz::TimeZone;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -64,7 +65,7 @@ pub struct QueryTools {
     templates_render: Rc<dyn SqlTemplatesRender>,
     model_context: QueryModelContext,
     params_allocator: Rc<RefCell<ParamsAllocator>>,
-    timezone: Tz,
+    timezone: TimeZone,
     convert_tz_for_raw_time_dimension: bool,
     masked_members: HashSet<String>,
     // Compiled mask filters keyed by member full path. Populated once by
@@ -98,11 +99,10 @@ impl QueryTools {
     ) -> Result<Rc<Self>, CubeError> {
         let templates_render = model_context.sql_templates(false, || base_tools.sql_templates())?;
         let timezone = if let Some(timezone) = timezone_name {
-            timezone
-                .parse::<Tz>()
-                .map_err(|_| CubeError::user(format!("Incorrect timezone {}", timezone)))?
+            QueryDateTimeHelper::time_zone(&timezone)
+                .ok_or_else(|| CubeError::user(format!("Incorrect timezone {}", timezone)))?
         } else {
-            Tz::UTC
+            TimeZone::UTC
         };
 
         let mut masked_set = HashSet::new();
@@ -190,8 +190,8 @@ impl QueryTools {
         &self.join_graph
     }
 
-    pub fn timezone(&self) -> Tz {
-        self.timezone
+    pub fn timezone(&self) -> &TimeZone {
+        &self.timezone
     }
 
     pub fn convert_tz_for_raw_time_dimension(&self) -> bool {

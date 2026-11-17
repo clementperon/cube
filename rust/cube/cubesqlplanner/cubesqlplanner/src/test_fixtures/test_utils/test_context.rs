@@ -14,14 +14,15 @@ use crate::planner::filter::Filter;
 use crate::planner::sql_templates::PlanSqlTemplates;
 use crate::planner::state::State;
 use crate::planner::top_level_planner::TopLevelPlanner;
+use crate::planner::QueryDateTimeHelper;
 use crate::planner::{CubeId, MemberSymbol, ModelContext, QueryModelContext, TimeDimensionSymbol};
 use crate::planner::{GranularityHelper, QueryProperties, QueryPropertiesCompiler, RequestOptions};
 use crate::test_fixtures::cube_bridge::yaml::YamlBaseQueryOptions;
 use crate::test_fixtures::cube_bridge::{
     members_from_strings, MockBaseQueryOptions, MockBaseTools, MockSchema, MockSecurityContext,
 };
-use chrono_tz::Tz;
 use cubenativeutils::CubeError;
+use jiff::tz::TimeZone;
 use std::rc::Rc;
 
 /// Test context providing query tools and symbol creation helpers
@@ -47,7 +48,7 @@ pub struct TestContext {
 
 impl TestContext {
     pub fn new(schema: MockSchema) -> Result<Self, CubeError> {
-        Self::new_with_options(schema, Tz::UTC, None, None, false, false)
+        Self::new_with_options(schema, TimeZone::UTC, None, None, false, false)
     }
 
     #[allow(dead_code)]
@@ -62,7 +63,7 @@ impl TestContext {
     fn rebuild_with_external_cubestore(self) -> Result<Self, CubeError> {
         Self::new_with_options_internal_ext(
             self.schema.clone(),
-            Tz::UTC,
+            TimeZone::UTC,
             None,
             None,
             false,
@@ -94,7 +95,7 @@ impl TestContext {
             security_context.clone(),
             Rc::new(base_tools),
             join_graph,
-            Some(Tz::UTC.to_string()),
+            Some("UTC".to_string()),
             false,
             false,
             None,
@@ -153,7 +154,7 @@ impl TestContext {
     ) -> Result<Self, CubeError> {
         Self::new_with_options_internal_ext(
             schema,
-            Tz::UTC,
+            TimeZone::UTC,
             None,
             None,
             false,
@@ -167,7 +168,7 @@ impl TestContext {
     }
 
     #[allow(dead_code)]
-    pub fn new_with_timezone(schema: MockSchema, timezone: Tz) -> Result<Self, CubeError> {
+    pub fn new_with_timezone(schema: MockSchema, timezone: TimeZone) -> Result<Self, CubeError> {
         Self::new_with_options(schema, timezone, None, None, false, false)
     }
 
@@ -182,14 +183,21 @@ impl TestContext {
                 filter: None,
             })
             .collect();
-        Self::new_with_options(schema, Tz::UTC, Some(items), None, false, false)
+        Self::new_with_options(schema, TimeZone::UTC, Some(items), None, false, false)
     }
 
     pub fn new_with_masked_member_items(
         schema: MockSchema,
         masked_members: Vec<MaskedMemberItem>,
     ) -> Result<Self, CubeError> {
-        Self::new_with_options(schema, Tz::UTC, Some(masked_members), None, false, false)
+        Self::new_with_options(
+            schema,
+            TimeZone::UTC,
+            Some(masked_members),
+            None,
+            false,
+            false,
+        )
     }
 
     // Tests plan as a Cube Store that supports multi-stage unless a query says otherwise.
@@ -202,8 +210,8 @@ impl TestContext {
         let timezone = static_data
             .timezone
             .as_deref()
-            .and_then(|tz| tz.parse::<Tz>().ok())
-            .unwrap_or(Tz::UTC);
+            .and_then(QueryDateTimeHelper::time_zone)
+            .unwrap_or(TimeZone::UTC);
 
         Self::new_with_options_internal_ext(
             self.schema.clone(),
@@ -230,7 +238,7 @@ impl TestContext {
 
     fn new_with_options(
         schema: MockSchema,
-        timezone: Tz,
+        timezone: TimeZone,
         masked_members: Option<Vec<MaskedMemberItem>>,
         member_to_alias: Option<std::collections::HashMap<String, String>>,
         export_annotated_sql: bool,
@@ -254,7 +262,7 @@ impl TestContext {
     #[allow(clippy::too_many_arguments)]
     fn new_with_options_internal_ext(
         schema: MockSchema,
-        timezone: Tz,
+        timezone: TimeZone,
         masked_members: Option<Vec<MaskedMemberItem>>,
         member_to_alias: Option<std::collections::HashMap<String, String>>,
         export_annotated_sql: bool,
@@ -266,11 +274,12 @@ impl TestContext {
         request_options: RequestOptions,
     ) -> Result<Self, CubeError> {
         use crate::test_fixtures::cube_bridge::MockDriverTools;
+        let timezone = QueryDateTimeHelper::time_zone_name(&timezone).to_string();
         let mut driver_tools = match custom_sql_templates.clone() {
             Some(templates) => {
-                MockDriverTools::with_sql_templates_and_timezone(templates, timezone.to_string())
+                MockDriverTools::with_sql_templates_and_timezone(templates, timezone.clone())
             }
-            None => MockDriverTools::with_timezone(timezone.to_string()),
+            None => MockDriverTools::with_timezone(timezone.clone()),
         };
         if !should_reuse_params {
             driver_tools = driver_tools.without_params_reuse();
@@ -280,7 +289,7 @@ impl TestContext {
             use crate::test_fixtures::cube_bridge::MockSqlTemplatesRender;
             let driver_tools = MockDriverTools::with_sql_templates_and_timezone(
                 MockSqlTemplatesRender::cubestore_templates(),
-                timezone.to_string(),
+                timezone.clone(),
             )
             .with_cubestore_dialect()
             // CubeStoreQuery renders positional `?`, so it never reuses params.
@@ -297,7 +306,7 @@ impl TestContext {
             security_context.clone(),
             Rc::new(base_tools),
             join_graph,
-            Some(timezone.to_string()),
+            Some(timezone),
             export_annotated_sql,
             convert_tz_for_raw_time_dimension,
             masked_members,
@@ -899,8 +908,9 @@ impl TestContext {
     /// parameters inlined so it can run as `CREATE TABLE ... AS (...)`.
     #[cfg(feature = "integration-postgres")]
     fn build_pre_agg_table_sql(&self, yaml: &str) -> String {
-        let pa_ctx = Self::new_with_options(self.schema.clone(), Tz::UTC, None, None, false, false)
-            .expect("Failed to create pre-agg context");
+        let pa_ctx =
+            Self::new_with_options(self.schema.clone(), TimeZone::UTC, None, None, false, false)
+                .expect("Failed to create pre-agg context");
 
         // Planned and resolved in one context, so the params a build range
         // allocates are the ones its placeholders refer to.

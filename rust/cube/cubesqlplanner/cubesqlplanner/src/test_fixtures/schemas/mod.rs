@@ -1,6 +1,6 @@
 use crate::planner::{Compiler, ModelCubes};
 use crate::test_fixtures::cube_bridge::{MockBaseTools, MockCubeEvaluator, MockSecurityContext};
-use chrono_tz::Tz;
+use jiff::tz::TimeZone;
 use std::rc::Rc;
 
 /// Helper struct that bundles together a Compiler with its dependencies for testing
@@ -11,11 +11,11 @@ pub struct TestCompiler {
 impl TestCompiler {
     /// Create a new TestCompiler from a MockCubeEvaluator
     pub fn new(evaluator: Rc<MockCubeEvaluator>) -> Self {
-        Self::new_with_timezone(evaluator, Tz::UTC)
+        Self::new_with_timezone(evaluator, TimeZone::UTC)
     }
 
     /// Create a new TestCompiler with a specific timezone
-    pub fn new_with_timezone(evaluator: Rc<MockCubeEvaluator>, timezone: Tz) -> Self {
+    pub fn new_with_timezone(evaluator: Rc<MockCubeEvaluator>, timezone: TimeZone) -> Self {
         let base_tools = Rc::new(MockBaseTools::default());
         let security_context = Rc::new(MockSecurityContext);
         let compiler = Compiler::new(

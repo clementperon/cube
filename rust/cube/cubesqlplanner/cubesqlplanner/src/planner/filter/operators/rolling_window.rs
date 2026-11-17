@@ -1,7 +1,7 @@
 use crate::planner::time_dimension::{shift_bound_wall_clock, QueryDateTimeHelper};
 use crate::planner::{QueryTimeSeries, SeriesSpan};
-use chrono_tz::Tz;
 use cubenativeutils::CubeError;
+use jiff::tz::TimeZone;
 
 /// `RegularRollingWindow` filter operation: trailing and leading
 /// interval bounds of a rolling window relative to each time-series
@@ -70,7 +70,7 @@ impl RollingWindowOffsetOp {
     /// The `[from, to]` band the window reads: the anchor moved by the frame.
     /// `None` where either side has no bound to state — an `unbounded` side,
     /// or an anchor the date range does not carry.
-    pub fn band(&self, tz: Tz) -> Result<Option<(String, String)>, CubeError> {
+    pub fn band(&self, tz: &TimeZone) -> Result<Option<(String, String)>, CubeError> {
         let precision = QueryTimeSeries::MILLISECOND_PRECISION;
         let anchor = if self.offset == "start" {
             self.from

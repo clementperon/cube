@@ -20,7 +20,7 @@ use super::FilterOperator;
 use crate::planner::time_dimension::UNBOUNDED_INTERVAL;
 use crate::planner::GranularityHelper;
 use crate::planner::SeriesSpan;
-use chrono_tz::Tz;
+use jiff::tz::TimeZone;
 
 /// Resolves TimeDimension to its base dimension symbol; returns as-is for other kinds.
 pub fn resolve_base_symbol(symbol: &Rc<MemberSymbol>) -> Rc<MemberSymbol> {
@@ -67,7 +67,7 @@ impl FilterOp {
     /// the shape the dialect renders the series in.
     pub fn rolling_scan_band(
         &self,
-        tz: Tz,
+        tz: &TimeZone,
         span_end: impl Fn(&SeriesSpan) -> Result<String, CubeError>,
     ) -> Result<Option<RollingScanBand>, CubeError> {
         let span_band = |span: &Option<SeriesSpan>| -> Result<RollingScanBand, CubeError> {

@@ -69,7 +69,7 @@ impl State {
             query_tools.model_cubes().clone(),
             base_tools,
             security_context,
-            query_tools.timezone(),
+            query_tools.timezone().clone(),
             member_to_alias,
             max_member_resolution_depth,
         )));

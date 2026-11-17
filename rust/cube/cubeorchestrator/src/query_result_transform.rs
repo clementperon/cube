@@ -6,10 +6,12 @@ use crate::{
     },
 };
 use anyhow::{bail, Context, Result};
-use chrono::format::{Fixed, Item, Numeric, Pad};
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use indexmap::{Equivalent, IndexMap};
 use itertools::multizip;
+use jiff::civil::DateTime;
+use jiff::fmt::strtime::BrokenDownTime;
+use jiff::fmt::temporal::DateTimePrinter;
+use jiff::fmt::StdFmtWrite;
 use serde::{
     de::{self, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer, Serialize,
@@ -191,6 +193,150 @@ fn is_standard_time_format(s: &str) -> bool {
         })
 }
 
+/// `YYYY-MM-DDTHH:MM:SS.sss`, the network protocol format of `time` values. The fraction is
+/// truncated to milliseconds.
+struct TimeValue<'a>(&'a DateTime);
+
+impl Display for TimeValue<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const PRINTER: DateTimePrinter = DateTimePrinter::new().precision(Some(3));
+
+        let dt = self.0;
+        if dt.year() >= 0 {
+            return PRINTER
+                .print_datetime(dt, StdFmtWrite(f))
+                .map_err(|_| std::fmt::Error);
+        }
+        // A year before 0 is written as a sign and four digits, not as the six-digit
+        // extended year `PRINTER` gives it.
+        write!(
+            f,
+            "{:+05}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}",
+            dt.year(),
+            dt.month(),
+            dt.day(),
+            dt.hour(),
+            dt.minute(),
+            dt.second(),
+            dt.millisecond()
+        )
+    }
+}
+
+/// Reads a `time` value in one of the formats the slow path of [`transform_value`] accepts:
+///
+/// - RFC 3339: `2024-01-01T00:00:00.000Z`, `2024-01-01 00:00:00+02:00`;
+/// - `2024-01-01 00:00:00`, with an optional fraction and an optional zone name or offset:
+///   `2024-01-01 00:00:00.000 UTC`, `2024-01-01 00:00:00.000 +00:00`;
+/// - `2024-01-01T00:00:00`, with nothing after the seconds.
+///
+/// Returns the date and time exactly as written: an offset or a zone name is not applied.
+fn parse_time_value(s: &str) -> Option<DateTime> {
+    parse_rfc3339_wall_clock(s)
+        .or_else(|| parse_spaced_wall_clock(s))
+        .or_else(|| DateTime::strptime("%Y-%m-%dT%H:%M:%S", s).ok())
+}
+
+/// The date and time of an RFC 3339 timestamp. The layout is strict: every field has its full
+/// width, and the offset is either `Z` or `±HH:MM`.
+fn parse_rfc3339_wall_clock(s: &str) -> Option<DateTime> {
+    // `0` stands for a digit, `T` for the date/time separator, any other byte must match as is.
+    const LAYOUT: &[u8; 19] = b"0000-00-00T00:00:00";
+
+    let bytes = s.as_bytes();
+    let (head, rest) = bytes.split_at_checked(LAYOUT.len())?;
+    let matches_layout = head.iter().zip(LAYOUT).all(|(&c, &f)| match f {
+        b'0' => c.is_ascii_digit(),
+        b'T' => matches!(c, b'T' | b't' | b' '),
+        _ => c == f,
+    });
+    if !matches_layout {
+        return None;
+    }
+    let number = |digits: &[u8]| digits.iter().fold(0, |n, d| n * 10 + i32::from(d - b'0'));
+
+    let (nanosecond, rest) = match rest {
+        [b'.', fraction @ ..] => {
+            let len = fraction.iter().take_while(|c| c.is_ascii_digit()).count();
+            if len == 0 {
+                return None;
+            }
+            // Digits past nanoseconds are dropped.
+            let kept = len.min(9);
+            let scale = 10_i32.pow((9 - kept) as u32);
+            (number(&fraction[..kept]) * scale, &fraction[len..])
+        }
+        _ => (0, rest),
+    };
+
+    let is_offset = |hours: &[u8], minutes: &[u8]| {
+        hours.iter().chain(minutes).all(u8::is_ascii_digit)
+            && number(hours) < 24
+            && number(minutes) < 60
+    };
+    let has_offset = match rest {
+        [b'Z' | b'z'] => true,
+        [b'+' | b'-', h1, h2, b':', m1, m2] => is_offset(&[*h1, *h2], &[*m1, *m2]),
+        // U+2212 MINUS SIGN
+        [0xE2, 0x88, 0x92, h1, h2, b':', m1, m2] => is_offset(&[*h1, *h2], &[*m1, *m2]),
+        _ => false,
+    };
+    if !has_offset {
+        return None;
+    }
+
+    // A leap second is read as the second before it.
+    let second = match number(&head[17..19]) {
+        60 => 59,
+        second => second,
+    };
+    DateTime::new(
+        number(&head[0..4]) as i16,
+        number(&head[5..7]) as i8,
+        number(&head[8..10]) as i8,
+        number(&head[11..13]) as i8,
+        number(&head[14..16]) as i8,
+        second as i8,
+        nanosecond,
+    )
+    .ok()
+}
+
+/// `%Y-%m-%d %H:%M:%S%.f`, optionally followed by a zone name (`%Z`: any run of non-whitespace
+/// characters) or by a numeric offset (`%:z`), either of them after optional whitespace.
+fn parse_spaced_wall_clock(s: &str) -> Option<DateTime> {
+    let (parsed, consumed) = BrokenDownTime::parse_prefix("%Y-%m-%d %H:%M:%S%.f", s).ok()?;
+    let date_time = parsed.to_datetime().ok()?;
+
+    let (head, tail) = s.split_at(consumed);
+    // `%.f` stops at nanoseconds; further digits of the same fraction are dropped.
+    let has_full_fraction = head
+        .rsplit_once('.')
+        .is_some_and(|(_, fraction)| fraction.len() == 9);
+    let tail = if has_full_fraction {
+        tail.trim_start_matches(|c: char| c.is_ascii_digit())
+    } else {
+        tail
+    };
+
+    let tail = tail.trim_start();
+    let is_zone_name = !tail.contains(char::is_whitespace);
+    (is_zone_name || is_numeric_offset(tail)).then_some(date_time)
+}
+
+/// `±HH:MM`, where the colon is optional and may be surrounded by whitespace.
+fn is_numeric_offset(s: &str) -> bool {
+    let Some(s) = s.strip_prefix(['+', '-', '\u{2212}']) else {
+        return false;
+    };
+    let Some((hours, s)) = s.split_at_checked(2) else {
+        return false;
+    };
+    let minutes = s.trim_start_matches(|c: char| c == ':' || c.is_whitespace());
+    hours.bytes().all(|c| c.is_ascii_digit())
+        && matches!(minutes.as_bytes(), [b'0'..=b'5', b'0'..=b'9'])
+}
+
 /// Transform specified `value` with specified `type` to the network protocol type.
 pub fn transform_value(value: DBResponsePrimitive, type_: &str) -> DBResponsePrimitive {
     match value {
@@ -203,44 +349,9 @@ pub fn transform_value(value: DBResponsePrimitive, type_: &str) -> DBResponsePri
 
             // Slow path for drivers that return other formats. Please do not add more
             // formats here - fix the driver to return the format of the fast path instead.
-            let formatted = DateTime::parse_from_rfc3339(s)
-                .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3f").to_string())
-                .or_else(|_| {
-                    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").map(|dt| {
-                        Utc.from_utc_datetime(&dt)
-                            .format("%Y-%m-%dT%H:%M:%S%.3f")
-                            .to_string()
-                    })
-                })
-                .or_else(|_| {
-                    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").map(|dt| {
-                        Utc.from_utc_datetime(&dt)
-                            .format("%Y-%m-%dT%H:%M:%S%.3f")
-                            .to_string()
-                    })
-                })
-                .or_else(|_| {
-                    NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").map(|dt| {
-                        Utc.from_utc_datetime(&dt)
-                            .format("%Y-%m-%dT%H:%M:%S%.3f")
-                            .to_string()
-                    })
-                })
-                .or_else(|_| {
-                    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f %Z").map(|dt| {
-                        Utc.from_utc_datetime(&dt)
-                            .format("%Y-%m-%dT%H:%M:%S%.3f")
-                            .to_string()
-                    })
-                })
-                .or_else(|_| {
-                    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f %:z").map(|dt| {
-                        Utc.from_utc_datetime(&dt)
-                            .format("%Y-%m-%dT%H:%M:%S%.3f")
-                            .to_string()
-                    })
-                })
-                .unwrap_or_else(|_| s.clone());
+            let formatted = parse_time_value(s)
+                .map(|dt| TimeValue(&dt).to_string())
+                .unwrap_or_else(|| s.clone());
             DBResponsePrimitive::String(formatted)
         }
         other => other,
@@ -1207,26 +1318,9 @@ pub enum DBResponsePrimitive {
     UInt64(u64),
     Float64(f64),
     String(String),
-    Timestamp(NaiveDateTime),
+    Timestamp(DateTime),
     Uncommon(Value),
 }
-
-/// `%Y-%m-%dT%H:%M:%S%.3f`
-const TIMESTAMP_ITEMS: &[Item<'static>] = &[
-    Item::Numeric(Numeric::Year, Pad::Zero),
-    Item::Literal("-"),
-    Item::Numeric(Numeric::Month, Pad::Zero),
-    Item::Literal("-"),
-    Item::Numeric(Numeric::Day, Pad::Zero),
-    Item::Literal("T"),
-    Item::Numeric(Numeric::Hour, Pad::Zero),
-    Item::Literal(":"),
-    Item::Numeric(Numeric::Minute, Pad::Zero),
-    Item::Literal(":"),
-    Item::Numeric(Numeric::Second, Pad::Zero),
-    // `%.3f`: leading dot followed by 3 fractional-second digits.
-    Item::Fixed(Fixed::Nanosecond3),
-];
 
 // Hand-written `Serialize`. Numeric variants (`Int64`/`UInt64`/`Float64`) are
 // rendered as JSON strings, not numbers: the legacy CubeStore result set carried
@@ -1243,9 +1337,7 @@ impl Serialize for DBResponsePrimitive {
             DBResponsePrimitive::UInt64(n) => serializer.collect_str(n),
             DBResponsePrimitive::Float64(n) => serializer.collect_str(n),
             DBResponsePrimitive::String(s) => serializer.serialize_str(s),
-            DBResponsePrimitive::Timestamp(dt) => {
-                serializer.collect_str(&dt.format_with_items(TIMESTAMP_ITEMS.iter()))
-            }
+            DBResponsePrimitive::Timestamp(dt) => serializer.collect_str(&TimeValue(dt)),
             DBResponsePrimitive::Uncommon(v) => v.serialize(serializer),
         }
     }
@@ -1359,9 +1451,7 @@ impl Display for DBResponsePrimitive {
             DBResponsePrimitive::UInt64(n) => n.to_string(),
             DBResponsePrimitive::Float64(n) => n.to_string(),
             DBResponsePrimitive::String(s) => s.clone(),
-            DBResponsePrimitive::Timestamp(dt) => {
-                dt.format_with_items(TIMESTAMP_ITEMS.iter()).to_string()
-            }
+            DBResponsePrimitive::Timestamp(dt) => TimeValue(dt).to_string(),
             DBResponsePrimitive::Uncommon(v) => {
                 serde_json::to_string(&v).unwrap_or_else(|_| v.to_string())
             }
@@ -2416,6 +2506,75 @@ mod tests {
         assert!(!is_standard_time_format("/024-01-01T00:01:00.000"));
         assert!(!is_standard_time_format("2024-01-:1T00:01:00.000"));
         assert!(!is_standard_time_format("2024-01-01T00:01:00.00:"));
+    }
+
+    #[test]
+    fn test_transform_value_time_slow_path_edges() {
+        let time =
+            |s: &str| match transform_value(DBResponsePrimitive::String(s.to_string()), "time") {
+                DBResponsePrimitive::String(s) => s,
+                other => panic!("expected a string, got {other:?}"),
+            };
+
+        // An offset is dropped, not applied.
+        assert_eq!(time("2024-01-01T10:00:00+02:00"), "2024-01-01T10:00:00.000");
+        assert_eq!(
+            time("2024-01-01 10:00:00.5 +02:00"),
+            "2024-01-01T10:00:00.500"
+        );
+        assert_eq!(
+            time("2024-01-01 10:00:00 +02 00"),
+            "2024-01-01T10:00:00.000"
+        );
+        assert_eq!(time("2024-01-01t10:00:00z"), "2024-01-01T10:00:00.000");
+        // Digits past nanoseconds are dropped.
+        assert_eq!(
+            time("2024-01-01 10:00:00.123456789012 UTC"),
+            "2024-01-01T10:00:00.123"
+        );
+        assert_eq!(
+            time("2024-01-01T10:00:00.123456789012Z"),
+            "2024-01-01T10:00:00.123"
+        );
+        // Fields narrower than their full width are fine without an offset.
+        assert_eq!(time("2024-1-5 4:30:00"), "2024-01-05T04:30:00.000");
+        assert_eq!(
+            time("0999-12-31 23:59:59.999999 UTC"),
+            "0999-12-31T23:59:59.999"
+        );
+
+        // None of the formats takes these, so they are returned as they came.
+        for s in [
+            "2024-01-01T10:00:00+0200",
+            "2024-01-01T10:00:00+24:00",
+            "2024-01-01T10:00Z",
+            "2024-01-01T10:00:00.123456",
+            "2024-1-5T4:30:00Z",
+            "2023-02-29T10:00:00Z",
+            "2024-01-01 10:00:00 +02:00 UTC",
+        ] {
+            assert_eq!(time(s), s);
+        }
+    }
+
+    #[test]
+    fn test_timestamp_renders_in_the_time_format() {
+        let render = |year, month, day, hour, minute, second, nanosecond| {
+            let dt = DateTime::new(year, month, day, hour, minute, second, nanosecond).unwrap();
+            DBResponsePrimitive::Timestamp(dt).to_string()
+        };
+
+        assert_eq!(render(2024, 1, 5, 4, 3, 2, 0), "2024-01-05T04:03:02.000");
+        // The fraction is truncated, not rounded.
+        assert_eq!(
+            render(1999, 12, 31, 23, 59, 59, 999_999_999),
+            "1999-12-31T23:59:59.999"
+        );
+        assert_eq!(
+            render(5, 1, 1, 0, 0, 0, 1_000_000),
+            "0005-01-01T00:00:00.001"
+        );
+        assert_eq!(render(-1, 1, 1, 0, 0, 0, 0), "-0001-01-01T00:00:00.000");
     }
 
     #[test]

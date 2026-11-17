@@ -8,8 +8,8 @@ use crate::physical_plan_builder::PhysicalPlanBuilder;
 use crate::planner::query_tools::QueryTools;
 use crate::planner::sql_templates::PlanSqlTemplates;
 use crate::planner::QueryDateTimeHelper;
-use chrono_tz::Tz;
 use cubenativeutils::CubeError;
+use jiff::tz::TimeZone;
 use std::rc::Rc;
 
 pub struct MultiStageTimeSeriesProcessor<'a> {
@@ -166,7 +166,7 @@ fn filter_range(
     // series is laid out in the query's time zone.
     let bound = |value: &str| -> Result<String, CubeError> {
         let param = query_tools.allocate_param(value);
-        if query_tools.timezone() == Tz::UTC {
+        if *query_tools.timezone() == TimeZone::UTC {
             Ok(param)
         } else {
             templates.convert_tz(templates.time_stamp_cast(param)?)

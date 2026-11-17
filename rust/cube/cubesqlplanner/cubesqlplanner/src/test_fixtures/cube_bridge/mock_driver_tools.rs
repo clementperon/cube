@@ -1,9 +1,10 @@
 use crate::cube_bridge::driver_tools::DriverTools;
 use crate::cube_bridge::sql_templates_render::SqlTemplatesRender;
+use crate::planner::QueryDateTimeHelper;
 use crate::test_fixtures::cube_bridge::MockSqlTemplatesRender;
-use chrono::NaiveDateTime;
-use chrono::TimeZone;
 use cubenativeutils::CubeError;
+use jiff::civil::DateTime;
+use jiff::tz::TimeZone;
 use std::any::Any;
 use std::rc::Rc;
 
@@ -187,10 +188,8 @@ impl DriverTools for MockDriverTools {
         if self.timezone == "UTC" {
             return Ok(date);
         }
-        let tz: chrono_tz::Tz = self
-            .timezone
-            .parse()
-            .map_err(|e| CubeError::user(format!("Unknown timezone {}: {}", self.timezone, e)))?;
+        let tz = QueryDateTimeHelper::time_zone(&self.timezone)
+            .ok_or_else(|| CubeError::user(format!("Unknown timezone {}", self.timezone)))?;
 
         let precision = self.timestamp_precision;
         let fmt = if precision == 3 {
@@ -199,21 +198,16 @@ impl DriverTools for MockDriverTools {
             "%Y-%m-%dT%H:%M:%S%.6f"
         };
 
-        let naive = NaiveDateTime::parse_from_str(&date, fmt)
+        let naive = DateTime::strptime(fmt, &date)
             .map_err(|e| CubeError::user(format!("Cannot parse timestamp '{}': {}", date, e)))?;
 
         let local_dt = tz
-            .from_local_datetime(&naive)
-            .single()
-            .ok_or_else(|| CubeError::user(format!("Ambiguous local time: {}", date)))?;
+            .to_ambiguous_zoned_datetime(naive)
+            .unambiguous()
+            .map_err(|_| CubeError::user(format!("Ambiguous local time: {}", date)))?;
 
-        let utc_dt = local_dt.with_timezone(&chrono::Utc);
-        let result = if precision == 3 {
-            utc_dt.format("%Y-%m-%dT%H:%M:%S%.3f").to_string()
-        } else {
-            utc_dt.format("%Y-%m-%dT%H:%M:%S%.6f").to_string()
-        };
-        Ok(result)
+        let utc_dt = TimeZone::UTC.to_datetime(local_dt.timestamp());
+        Ok(utc_dt.strftime(fmt).to_string())
     }
 
     fn get_allocated_params(&self) -> Result<Vec<String>, CubeError> {

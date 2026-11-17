@@ -5,9 +5,8 @@ use crate::planner::query_tools::QueryTools;
 use crate::planner::state::State;
 use crate::planner::time_dimension::Granularity;
 use crate::planner::{CubeId, GranularityHelper, MemberId, QueryDateTime, QueryDateTimeHelper};
-use chrono::Duration;
-use chrono_tz::Tz;
 use cubenativeutils::CubeError;
+use jiff::tz::TimeZone;
 use std::rc::Rc;
 
 /// `MemberSymbol::TimeDimension` body: a base time dimension viewed
@@ -346,10 +345,8 @@ impl TimeDimensionSymbol {
             let from_date_str = QueryDateTimeHelper::format_from_date(&date_range.0, 3)?;
             let to_date_str = QueryDateTimeHelper::format_to_date(&date_range.1, 3)?;
             let start = QueryDateTime::from_date_str(tz, &from_date_str)?;
-            let end = QueryDateTime::from_date_str(tz, &to_date_str)?;
-            let end = end.add_duration(Duration::milliseconds(1))?;
             let start_granularity = start.granularity();
-            let end_granularity = end.granularity();
+            let end_granularity = QueryDateTime::granularity_after_range_end(tz, &to_date_str)?;
             GranularityHelper::min_granularity(&Some(start_granularity), &Some(end_granularity))
         } else {
             Ok(None)
@@ -408,7 +405,7 @@ impl TimeDimensionSymbol {
     pub fn get_range_for_time_series(
         &self,
         date_range: Option<Vec<String>>,
-        tz: Tz,
+        tz: &TimeZone,
     ) -> Result<Option<(String, String)>, CubeError> {
         let res = if let Some(date_range) = &date_range {
             if date_range.len() != 2 {

@@ -792,7 +792,7 @@ impl PreAggregationOptimizer {
                             .unwrap_or(from);
                         // A month shift clamps the day of month, so either end alone
                         // can lose the last source day; the later of the two covers both.
-                        let tick = chrono::Duration::milliseconds(1);
+                        let tick = jiff::SignedDuration::from_millis(1);
                         let inclusive = QueryDateTime::from_date_str(tz, &to)
                             .and_then(|dt| dt.add_interval(&neg))
                             .map(|dt| dt.default_format());

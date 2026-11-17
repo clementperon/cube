@@ -1,10 +1,11 @@
 use crate::cube_bridge::evaluator::CubeEvaluator;
 use crate::planner::{Compiler, MemberSymbol, TimeDimensionSymbol};
 use crate::planner::{Granularity, QueryDateTimeHelper};
-use chrono::prelude::*;
-use chrono_tz::Tz;
 use cubenativeutils::CubeError;
 use itertools::Itertools;
+use jiff::civil::DateTime;
+use jiff::tz::TimeZone;
+use jiff::ZonedDateTime;
 use lazy_static::lazy_static;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -194,18 +195,24 @@ impl GranularityHelper {
         &STANDARD_GRANULARITY_HIERARCHIES
     }
 
-    pub fn parse_date_time_in_tz(date: &str, timezone: &Tz) -> Result<DateTime<Tz>, CubeError> {
+    pub fn parse_date_time_in_tz(
+        date: &str,
+        timezone: &TimeZone,
+    ) -> Result<ZonedDateTime, CubeError> {
         let local_dt = Self::parse_date_time(date)?;
-        if let Some(result) = timezone.from_local_datetime(&local_dt).single() {
-            Ok(result)
-        } else {
-            Err(CubeError::user(format!(
-                "Error while parsing date `{date}` in timezone `{timezone}`"
-            )))
-        }
+        // Neither a time a DST gap skips nor one a fold repeats.
+        timezone
+            .to_ambiguous_zoned_datetime(local_dt)
+            .unambiguous()
+            .map_err(|_| {
+                CubeError::user(format!(
+                    "Error while parsing date `{date}` in timezone `{}`",
+                    QueryDateTimeHelper::time_zone_name(timezone)
+                ))
+            })
     }
 
-    pub fn parse_date_time(date: &str) -> Result<NaiveDateTime, CubeError> {
+    pub fn parse_date_time(date: &str) -> Result<DateTime, CubeError> {
         QueryDateTimeHelper::parse_native_date_time(date)
     }
 
@@ -237,7 +244,7 @@ impl GranularityHelper {
 
             if gran_eval_sql.is_some() || !Self::is_predefined_granularity(&granularity) {
                 Some(Granularity::try_new_custom(
-                    timezone.clone(),
+                    &timezone,
                     granularity.clone(),
                     granularity_definition.static_data().origin.clone(),
                     granularity_definition.static_data().interval.clone(),
@@ -246,7 +253,7 @@ impl GranularityHelper {
                 )?)
             } else {
                 Some(Granularity::try_new_predefined(
-                    timezone.clone(),
+                    &timezone,
                     granularity.clone(),
                 )?)
             }

@@ -1,9 +1,10 @@
-use super::{GranularityHelper, QueryDateTime, SqlInterval};
+use super::{GranularityHelper, QueryDateTime, QueryDateTimeHelper, SqlInterval};
 use crate::planner::sql_templates::PlanSqlTemplates;
 use crate::planner::symbols::deps::symbol_deps;
 use crate::planner::SqlCall;
-use chrono_tz::Tz;
 use cubenativeutils::CubeError;
+use jiff::tz::TimeZone;
+use jiff::SignedDuration;
 use std::rc::Rc;
 use std::str::FromStr;
 
@@ -31,7 +32,7 @@ symbol_deps! {
 }
 
 impl Granularity {
-    pub fn try_new_predefined(timezone: Tz, granularity: String) -> Result<Self, CubeError> {
+    pub fn try_new_predefined(timezone: &TimeZone, granularity: String) -> Result<Self, CubeError> {
         let granularity_interval = format!("1 {}", granularity).parse()?;
         let origin = Self::default_origin(timezone)?;
 
@@ -46,7 +47,7 @@ impl Granularity {
         })
     }
     pub fn try_new_custom(
-        timezone: Tz,
+        timezone: &TimeZone,
         granularity: String,
         origin: Option<String>,
         granularity_interval: String,
@@ -178,7 +179,7 @@ impl Granularity {
         date.align_to_origin(&self.origin, &self.granularity_interval)
     }
 
-    fn default_origin(timezone: Tz) -> Result<QueryDateTime, CubeError> {
+    fn default_origin(timezone: &TimeZone) -> Result<QueryDateTime, CubeError> {
         QueryDateTime::now(timezone).start_of("year")
     }
 
@@ -266,11 +267,18 @@ impl Granularity {
         &self,
         start_str: &str,
         end_str: &str,
-        timezone: Tz,
+        timezone: &TimeZone,
     ) -> Result<bool, CubeError> {
+        // A range closing in the last days of year 9999 is open-ended in practice, and its end
+        // may have no instant to step up to: it is aligned with no interval.
+        let end_local = QueryDateTimeHelper::parse_native_date_time(end_str)?;
+        if QueryDateTime::is_past_last_instant(end_local) {
+            return Ok(false);
+        }
+
         let start = QueryDateTime::from_date_str(timezone, start_str)?;
-        let end = QueryDateTime::from_date_str(timezone, end_str)?;
-        let end = end.add_duration(chrono::Duration::milliseconds(1))?;
+        let end = QueryDateTime::from_local_date_time(timezone, end_local)?;
+        let end = end.add_duration(SignedDuration::from_millis(1))?;
 
         // Check if the start is aligned with the origin first
         let aligned_start = self.align_date_to_origin(start.clone())?;
@@ -296,15 +304,15 @@ impl Granularity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Datelike, NaiveDate, Weekday};
+    use jiff::civil::{date, Date, Weekday};
 
-    fn origin_date(g: &Granularity) -> NaiveDate {
-        NaiveDate::parse_from_str(&g.origin_local_formatted()[..10], "%Y-%m-%d").unwrap()
+    fn origin_date(g: &Granularity) -> Date {
+        Date::strptime("%Y-%m-%d", &g.origin_local_formatted()[..10]).unwrap()
     }
 
     fn custom(interval: &str, origin: Option<&str>, offset: Option<&str>) -> Granularity {
         Granularity::try_new_custom(
-            "UTC".parse::<Tz>().unwrap(),
+            &TimeZone::UTC,
             "test_granularity".to_string(),
             origin.map(str::to_string),
             interval.to_string(),
@@ -312,6 +320,25 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_range_closing_at_the_end_of_year_9999_is_not_aligned() {
+        // The end has no instant to step up to; that is no error, the range is just open-ended.
+        let yearly = custom("1 year", Some("2024-01-01"), None);
+        let aligned = |from: &str, to: &str| {
+            yearly
+                .is_aligned_with_date_range(from, to, &TimeZone::UTC)
+                .unwrap()
+        };
+        assert!(aligned(
+            "2024-01-01T00:00:00.000",
+            "2025-12-31T23:59:59.999"
+        ));
+        assert!(!aligned(
+            "2024-01-01T00:00:00.000",
+            "9999-12-31T23:59:59.999"
+        ));
     }
 
     fn offset_of(interval: &str, origin: &str) -> Option<String> {
@@ -324,7 +351,7 @@ mod tests {
     fn week_only_default_origin_snaps_to_iso_monday() {
         assert_eq!(
             origin_date(&custom("2 weeks", None, None)).weekday(),
-            Weekday::Mon
+            Weekday::Monday
         );
     }
 
@@ -339,7 +366,7 @@ mod tests {
         // Monday-of-year-start + 2 days => Wednesday.
         assert_eq!(
             origin_date(&custom("2 weeks", None, Some("2 days"))).weekday(),
-            Weekday::Wed
+            Weekday::Wednesday
         );
     }
 
@@ -348,7 +375,7 @@ mod tests {
         // 2024-01-03 is a Wednesday; an explicit origin must be preserved verbatim.
         assert_eq!(
             origin_date(&custom("2 weeks", Some("2024-01-03"), None)),
-            NaiveDate::from_ymd_opt(2024, 1, 3).unwrap()
+            date(2024, 1, 3)
         );
     }
 
