@@ -179,7 +179,7 @@ impl Granularity {
     }
 
     fn default_origin(timezone: Tz) -> Result<QueryDateTime, CubeError> {
-        QueryDateTime::now(timezone)?.start_of("year")
+        QueryDateTime::now(timezone).start_of("year")
     }
 
     /// An explicit origin on a single-unit interval is a natural boundary plus a constant shift,

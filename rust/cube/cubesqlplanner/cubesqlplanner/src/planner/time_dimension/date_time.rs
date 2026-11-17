@@ -55,9 +55,9 @@ impl QueryDateTime {
     pub fn new(date_time: DateTime<Tz>) -> QueryDateTime {
         QueryDateTime { date_time }
     }
-    pub fn now(tz: Tz) -> Result<QueryDateTime, CubeError> {
-        let local = Local::now().naive_local();
-        Self::from_local_date_time(tz, local)
+    /// The current instant, on the wall clock of `tz`.
+    pub fn now(tz: Tz) -> QueryDateTime {
+        Self::new(Utc::now().with_timezone(&tz))
     }
     pub fn from_date_str(tz: Tz, date: &str) -> Result<Self, CubeError> {
         let local_dt = QueryDateTimeHelper::parse_native_date_time(date)?;
