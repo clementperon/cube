@@ -3,11 +3,12 @@ use crate::timestamp::pg_base_date_epoch;
 use crate::{FromProtocolValue, ProtocolError, ToProtocolValue};
 use byteorder::{BigEndian, ByteOrder};
 use bytes::{BufMut, BytesMut};
-use chrono::NaiveDate;
+use jiff::{civil::Date, SignedDuration};
 use std::backtrace::Backtrace;
+use std::convert::TryFrom;
 use std::io::Error;
 
-pub type DateValue = NaiveDate;
+pub type DateValue = Date;
 
 impl ToProtocolValue for DateValue {
     // date_out - https://github.com/postgres/postgres/blob/REL_14_4/src/backend/utils/adt/date.c#L176
@@ -17,19 +18,17 @@ impl ToProtocolValue for DateValue {
 
     // date_send - https://github.com/postgres/postgres/blob/REL_14_4/src/backend/utils/adt/date.c#L223
     fn to_binary(&self, buf: &mut BytesMut) -> Result<(), ProtocolError> {
-        let n = self
-            .signed_duration_since(pg_base_date_epoch().date())
-            .num_days();
-        if n > (i32::MAX as i64) {
-            return Err(Error::other(format!(
+        // Both dates are civil, so the difference is a whole number of 24-hour days.
+        let n = self.duration_since(pg_base_date_epoch().date()).as_hours() / 24;
+        let n = i32::try_from(n).map_err(|_| {
+            Error::other(format!(
                 "value too large to store in the binary format (i32), actual: {}",
                 n
             ))
-            .into());
-        }
+        })?;
 
         buf.put_i32(4);
-        buf.put_i32(n as i32);
+        buf.put_i32(n);
 
         Ok(())
     }
@@ -44,7 +43,7 @@ impl FromProtocolValue for DateValue {
         })?;
 
         // Parse date string in format "YYYY-MM-DD"
-        NaiveDate::parse_from_str(as_str, "%Y-%m-%d").map_err(|err| ProtocolError::ErrorResponse {
+        Date::strptime("%Y-%m-%d", as_str).map_err(|err| ProtocolError::ErrorResponse {
             source: ErrorResponse::error(
                 ErrorCode::ProtocolViolation,
                 format!("Unable to parse date from text '{}': {}", as_str, err),
@@ -72,8 +71,8 @@ impl FromProtocolValue for DateValue {
         let base_date = pg_base_date_epoch().date();
 
         base_date
-            .checked_add_signed(chrono::Duration::days(days_since_epoch as i64))
-            .ok_or_else(|| ProtocolError::ErrorResponse {
+            .checked_add(SignedDuration::from_hours(days_since_epoch as i64 * 24))
+            .map_err(|_| ProtocolError::ErrorResponse {
                 source: ErrorResponse::error(
                     ErrorCode::ProtocolViolation,
                     format!(
@@ -95,14 +94,14 @@ mod tests {
     fn test_date_from_text() {
         let date_str = b"2025-08-08";
         let result = DateValue::from_protocol(date_str, Format::Text).unwrap();
-        let expected = DateValue::from_ymd_opt(2025, 8, 8).unwrap();
+        let expected = DateValue::constant(2025, 8, 8);
         assert_eq!(result, expected);
     }
 
     #[test]
     fn test_date_from_binary() {
         // Create a date and encode it
-        let date = DateValue::from_ymd_opt(2025, 8, 8).unwrap();
+        let date = DateValue::constant(2025, 8, 8);
         let mut buf = BytesMut::new();
         date.to_binary(&mut buf).unwrap();
 
@@ -124,7 +123,7 @@ mod tests {
     #[test]
     fn test_date_before_the_pg_epoch() {
         // Test date before epoch
-        let before_epoch = DateValue::from_ymd_opt(1999, 12, 31).unwrap();
+        let before_epoch = DateValue::constant(1999, 12, 31);
         let mut buf = BytesMut::new();
         before_epoch.to_binary(&mut buf).unwrap();
         let binary_data = &buf[4..];

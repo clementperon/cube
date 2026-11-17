@@ -7,7 +7,6 @@ use std::{
     thread,
 };
 
-use chrono::{Datelike, Days, Duration, Months, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use datafusion::{
     arrow::{
         array::{
@@ -25,7 +24,6 @@ use datafusion::{
             IntervalDayTimeType, IntervalMonthDayNanoType, IntervalUnit, IntervalYearMonthType,
             TimeUnit, TimestampNanosecondType, UInt32Type,
         },
-        temporal_conversions::timestamp_ns_to_datetime,
     },
     error::{DataFusionError, Result},
     execution::context::SessionContext,
@@ -42,6 +40,12 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use itertools::izip;
+use jiff::{
+    civil::{Date, DateTime, Time},
+    fmt::strtime,
+    tz::Offset,
+    SignedDuration, Span, Timestamp,
+};
 use pg_srv::{PgType, PgTypeId};
 use regex::Regex;
 use sha1_smol::Sha1;
@@ -56,6 +60,11 @@ use crate::{
         },
     },
     sql::SessionState,
+    utils::datetime::{
+        date_from_unix_days, datetime_from_unix_micros, datetime_from_unix_millis,
+        datetime_from_unix_nanos, datetime_from_unix_seconds, unix_days, unix_nanos, unix_seconds,
+        SqlDateTime, SubsecFraction,
+    },
 };
 
 type IntervalDayTime = <IntervalDayTimeType as ArrowPrimitiveType>::Native;
@@ -794,7 +803,6 @@ pub fn create_to_date_udf() -> ScalarUDF {
         let dates = downcast_string_arg!(args[0], "date", i32);
         let formats = downcast_string_arg!(args[1], "format", i32);
 
-        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
         let mut builder = Date32Builder::with_capacity(dates.len());
         for i in 0..dates.len() {
             if dates.is_null(i) || formats.is_null(i) {
@@ -802,7 +810,7 @@ pub fn create_to_date_udf() -> ScalarUDF {
                 continue;
             }
 
-            let chrono_format = match formats.value(i) {
+            let strptime_format = match formats.value(i) {
                 "YYYY-MM-DD" | "yyyy-MM-dd" => "%Y-%m-%d",
                 format => {
                     return Err(DataFusionError::NotImplemented(format!(
@@ -811,14 +819,14 @@ pub fn create_to_date_udf() -> ScalarUDF {
                     )))
                 }
             };
-            let date = NaiveDate::parse_from_str(dates.value(i), chrono_format).map_err(|e| {
+            let date = Date::strptime(strptime_format, dates.value(i)).map_err(|e| {
                 DataFusionError::Execution(format!(
                     "Error parsing {:?} in TO_DATE: {}",
                     dates.value(i),
                     e
                 ))
             })?;
-            builder.append_value(date.signed_duration_since(epoch).num_days() as i32);
+            builder.append_value(unix_days(date));
         }
 
         Ok(Arc::new(builder.finish()) as ArrayRef)
@@ -901,7 +909,6 @@ pub fn create_date_udf() -> ScalarUDF {
         assert!(args.len() == 1);
 
         const NANOS_PER_DAY: i64 = 86_400_000_000_000;
-        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
 
         let mut builder = Date32Builder::with_capacity(args[0].len());
         if let Some(strings) = args[0].as_any().downcast_ref::<StringArray>() {
@@ -910,7 +917,7 @@ pub fn create_date_udf() -> ScalarUDF {
                     builder.append_null();
                 } else {
                     let date = parse_date_str(strings.value(i))?.date();
-                    builder.append_value(date.signed_duration_since(epoch).num_days() as i32);
+                    builder.append_value(unix_days(date));
                 }
             }
         } else if let Some(timestamps) = args[0].as_any().downcast_ref::<TimestampNanosecondArray>()
@@ -1093,6 +1100,24 @@ pub fn create_second_udf() -> ScalarUDF {
     )
 }
 
+/// An Arrow date or timestamp type whose values are a UTC date and time.
+trait DateTimeNative: ArrowPrimitiveType {
+    /// `None` when the value is outside years `-9999..=9999`.
+    fn to_datetime(value: Self::Native) -> Option<DateTime>;
+}
+
+impl DateTimeNative for TimestampNanosecondType {
+    fn to_datetime(value: i64) -> Option<DateTime> {
+        Some(datetime_from_unix_nanos(value))
+    }
+}
+
+impl DateTimeNative for Date32Type {
+    fn to_datetime(value: i32) -> Option<DateTime> {
+        date_from_unix_days(value).map(|date| date.to_datetime(Time::midnight()))
+    }
+}
+
 macro_rules! date_math_udf {
     ($ARGS: expr, $FIRST_ARG_TYPE: ident, $SECOND_ARG_TYPE: ident, $FUN: ident, $IS_ADD: expr) => {{
         let timestamps = downcast_primitive_arg!(&$ARGS[0], "datetime", $FIRST_ARG_TYPE);
@@ -1102,14 +1127,20 @@ macro_rules! date_math_udf {
             if timestamps.is_null(i) || intervals.is_null(i) {
                 builder.append_null();
             } else {
-                let timestamp = timestamps.value_as_datetime(i).unwrap();
+                let value = timestamps.value(i);
+                let timestamp = <$FIRST_ARG_TYPE as DateTimeNative>::to_datetime(value)
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "Cannot convert {} to a date and time: {}",
+                            <$FIRST_ARG_TYPE as ArrowPrimitiveType>::DATA_TYPE,
+                            value
+                        ))
+                    })?;
                 let interval = intervals.value(i).into();
                 let result = $FUN(timestamp, interval, $IS_ADD)?;
                 builder.append_value(
-                    result
-                        .and_utc()
-                        .timestamp_nanos_opt()
-                        .ok_or_else(|| date_out_of_timestamp_range(result))?,
+                    unix_nanos(result)
+                        .ok_or_else(|| date_out_of_timestamp_range(SqlDateTime(result)))?,
                 );
             }
         }
@@ -1274,15 +1305,15 @@ pub fn create_date_sub_udf() -> ScalarUDF {
     )
 }
 
-fn date_addsub_year_month(t: NaiveDateTime, i: i32, is_add: bool) -> Result<NaiveDateTime> {
+fn date_addsub_year_month(t: DateTime, i: i32, is_add: bool) -> Result<DateTime> {
     let i = match is_add {
         true => i,
         false => -i,
     };
 
-    let mut year = t.year();
+    let mut year = i32::from(t.year());
     // Note month is numbered 0..11 in this function.
-    let mut month = t.month() as i32 - 1;
+    let mut month = i32::from(t.month()) - 1;
 
     year += i / 12;
     month += i % 12;
@@ -1295,7 +1326,7 @@ fn date_addsub_year_month(t: NaiveDateTime, i: i32, is_add: bool) -> Result<Naiv
     year += month / 12;
     month %= 12;
 
-    match change_ym(t, year, 1 + month as u32) {
+    match change_ym(t, year, 1 + month as i8) {
         Some(t) => return Ok(t),
         None => {
             return Err(DataFusionError::Execution(format!(
@@ -1307,79 +1338,61 @@ fn date_addsub_year_month(t: NaiveDateTime, i: i32, is_add: bool) -> Result<Naiv
     };
 }
 
+/// Adds calendar months, keeping the day of month unless the target month is shorter.
+fn add_months(t: DateTime, months: i64) -> Option<DateTime> {
+    t.checked_add(Span::new().try_months(months).ok()?).ok()
+}
+
+/// Adds calendar days, keeping the time of day.
+fn add_days(t: DateTime, days: i64) -> Option<DateTime> {
+    t.checked_add(Span::new().try_days(days).ok()?).ok()
+}
+
 fn date_addsub_month_day_nano(
-    t: NaiveDateTime,
+    t: DateTime,
     i: IntervalMonthDayNano,
     is_add: bool,
-) -> Result<NaiveDateTime> {
+) -> Result<DateTime> {
     let (month, day, nano) = IntervalMonthDayNanoType::to_parts(i);
+    let sign = if is_add { 1 } else { -1 };
 
-    let result = if month > 0 && is_add || month < 0 && !is_add {
-        t.checked_add_months(Months::new(month as u32))
-    } else {
-        t.checked_sub_months(Months::new(month.unsigned_abs()))
-    };
-
-    let result = if day > 0 && is_add || day < 0 && !is_add {
-        result.and_then(|t| t.checked_add_days(Days::new(day as u64)))
-    } else {
-        result.and_then(|t| t.checked_sub_days(Days::new(day.unsigned_abs() as u64)))
-    };
-
-    let result = result.and_then(|t| {
-        t.checked_add_signed(Duration::nanoseconds(nano * (if !is_add { -1 } else { 1 })))
-    });
-    result.ok_or_else(|| {
-        DataFusionError::Execution(format!(
-            "Failed to add interval: {} month {} day {} nano",
-            month, day, nano
-        ))
-    })
+    add_months(t, i64::from(month) * sign)
+        .and_then(|t| add_days(t, i64::from(day) * sign))
+        .and_then(|t| {
+            let nano = nano.checked_mul(sign)?;
+            t.checked_add(SignedDuration::from_nanos(nano)).ok()
+        })
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "Failed to add interval: {} month {} day {} nano",
+                month, day, nano
+            ))
+        })
 }
 
-fn date_addsub_day_time(
-    t: NaiveDateTime,
-    interval: IntervalDayTime,
-    is_add: bool,
-) -> Result<NaiveDateTime> {
+fn date_addsub_day_time(t: DateTime, interval: IntervalDayTime, is_add: bool) -> Result<DateTime> {
     let (days, millis) = IntervalDayTimeType::to_parts(interval);
+    let sign = if is_add { 1 } else { -1 };
 
-    let result = if days > 0 && is_add || days < 0 && !is_add {
-        t.checked_add_days(Days::new(days as u64))
-    } else {
-        t.checked_sub_days(Days::new(days.unsigned_abs() as u64))
-    };
-
-    let result = result.and_then(|t| {
-        t.checked_add_signed(Duration::milliseconds(
-            millis as i64 * (if !is_add { -1 } else { 1 }),
-        ))
-    });
-    result.ok_or_else(|| {
-        DataFusionError::Execution(format!(
-            "Failed to add interval: {} day {} ms",
-            days, millis
-        ))
-    })
+    add_days(t, i64::from(days) * sign)
+        .and_then(|t| {
+            t.checked_add(SignedDuration::from_millis(i64::from(millis) * sign))
+                .ok()
+        })
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "Failed to add interval: {} day {} ms",
+                days, millis
+            ))
+        })
 }
 
-fn change_ym(t: NaiveDateTime, y: i32, m: u32) -> Option<NaiveDateTime> {
+fn change_ym(t: DateTime, y: i32, m: i8) -> Option<DateTime> {
     debug_assert!((1..=12).contains(&m));
-    let mut d = t.day();
-    d = d.min(last_day_of_month(y, m));
-    t.with_day(1)?.with_year(y)?.with_month(m)?.with_day(d)
-}
-
-fn last_day_of_month(y: i32, m: u32) -> u32 {
-    debug_assert!((1..=12).contains(&m));
-    if m == 12 {
-        return 31;
-    }
-    NaiveDate::from_ymd_opt(y, m + 1, 1)
-        .unwrap_or_else(|| panic!("Invalid year month: {}-{}", y, m))
-        .pred_opt()
-        .unwrap_or_else(|| panic!("Invalid year month: {}-{}", y, m))
-        .day()
+    let first_of_month = Date::new(y.try_into().ok()?, m, 1).ok()?;
+    let d = t.day().min(first_of_month.days_in_month());
+    let date = Date::new(first_of_month.year(), m, d).ok()?;
+    Some(date.to_datetime(t.time()))
 }
 
 fn postgres_datetime_format_to_iso(format: String) -> String {
@@ -1394,7 +1407,6 @@ fn postgres_datetime_format_to_iso(format: String) -> String {
         .replace(".%f", "%.f")
         .replace("YYYY", "%Y")
         .replace("yyyy", "%Y")
-        // NOTE: "%q" is not a part of chrono
         .replace("Q", "%q")
         .replace("Mon", "%b")
         .replace("DD", "%d")
@@ -1437,7 +1449,7 @@ pub fn create_str_to_date_udf() -> ScalarUDF {
 
             let format = postgres_datetime_format_to_iso(format.clone());
 
-            let mut res = NaiveDateTime::parse_from_str(timestamp, &format).map_err(|e| {
+            let mut res = DateTime::strptime(&format, timestamp).map_err(|e| {
                 DataFusionError::Execution(format!(
                     "Error evaluating str_to_date('{timestamp}', '{format}'): {e}"
                 ))
@@ -1445,21 +1457,14 @@ pub fn create_str_to_date_udf() -> ScalarUDF {
 
             // Try parsing with date format if parsing with datetime format fails
             if res.is_err() {
-                if let Ok(dt) = NaiveDate::parse_from_str(timestamp, &format).map(|d| {
-                    d.and_hms_opt(0, 0, 0)
-                        .expect("Unable to add zero time to naive date")
-                }) {
-                    res = Ok(dt);
+                if let Ok(date) = Date::strptime(&format, timestamp) {
+                    res = Ok(date.to_datetime(Time::midnight()));
                 }
             }
             let res = res?;
 
             Ok(ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(
-                Some(
-                    res.and_utc()
-                        .timestamp_nanos_opt()
-                        .ok_or_else(|| date_out_of_timestamp_range(res))?,
-                ),
+                Some(unix_nanos(res).ok_or_else(|| date_out_of_timestamp_range(SqlDateTime(res)))?),
                 None,
             )))
         });
@@ -1494,20 +1499,13 @@ pub fn create_current_timestamp_udf(name: &str) -> ScalarUDF {
     )
 }
 
+/// The values of a timestamp array, together with how to read one as a UTC date and time.
 macro_rules! parse_timestamp_arr {
-    ($ARR:expr, $ARR_TYPE: ident, $FN_NAME: ident) => {{
-        let arr = $ARR.as_any().downcast_ref::<$ARR_TYPE>();
-        if arr.is_some() {
-            let mut result = Vec::new();
-            let arr = arr.unwrap();
-            for i in 0..arr.len() {
-                result.push(chrono::Duration::$FN_NAME(arr.value(i)));
-            }
-
-            Some(result)
-        } else {
-            None
-        }
+    ($ARR:expr, $ARR_TYPE: ident, $TO_DATETIME: expr) => {{
+        let to_datetime: fn(i64) -> Option<DateTime> = $TO_DATETIME;
+        $ARR.as_any()
+            .downcast_ref::<$ARR_TYPE>()
+            .map(|arr| (arr.values().to_vec(), to_datetime))
     }};
 }
 
@@ -1515,21 +1513,23 @@ pub fn create_to_char_udf() -> ScalarUDF {
     let fun: Arc<dyn Fn(&[ColumnarValue]) -> Result<ColumnarValue> + Send + Sync> =
         make_scalar_function(move |args: &[ArrayRef]| {
             let arr = &args[0];
-            let (durations, timezone) = match arr.data_type() {
+            let (timestamps, timezone) = match arr.data_type() {
                 DataType::Timestamp(TimeUnit::Nanosecond, str) => (
-                    parse_timestamp_arr!(arr, TimestampNanosecondArray, nanoseconds),
+                    parse_timestamp_arr!(arr, TimestampNanosecondArray, |nanos| Some(
+                        datetime_from_unix_nanos(nanos)
+                    )),
                     str.clone().unwrap_or_default(),
                 ),
                 DataType::Timestamp(TimeUnit::Millisecond, str) => (
-                    parse_timestamp_arr!(arr, TimestampMillisecondArray, milliseconds),
+                    parse_timestamp_arr!(arr, TimestampMillisecondArray, datetime_from_unix_millis),
                     str.clone().unwrap_or_default(),
                 ),
                 DataType::Timestamp(TimeUnit::Microsecond, str) => (
-                    parse_timestamp_arr!(arr, TimestampMicrosecondArray, microseconds),
+                    parse_timestamp_arr!(arr, TimestampMicrosecondArray, datetime_from_unix_micros),
                     str.clone().unwrap_or_default(),
                 ),
                 DataType::Timestamp(TimeUnit::Second, str) => (
-                    parse_timestamp_arr!(arr, TimestampSecondArray, seconds),
+                    parse_timestamp_arr!(arr, TimestampSecondArray, datetime_from_unix_seconds),
                     str.clone().unwrap_or_default(),
                 ),
                 dt => {
@@ -1540,36 +1540,42 @@ pub fn create_to_char_udf() -> ScalarUDF {
                 }
             };
 
-            if durations.is_none() {
+            let Some((timestamps, to_datetime)) = timestamps else {
                 return Err(DataFusionError::Execution(
                     "unsupported datetime format for to_char".to_string(),
                 ));
-            }
+            };
 
-            let durations = durations.unwrap();
             let formats = downcast_string_arg!(&args[1], "format_str", i32);
 
-            let mut builder = StringBuilder::with_capacity(durations.len(), durations.len());
+            let mut builder = StringBuilder::with_capacity(timestamps.len(), timestamps.len());
 
-            for (i, duration) in durations.iter().enumerate() {
-                if duration.is_zero() {
+            for (i, value) in timestamps.into_iter().enumerate() {
+                if value == 0 {
                     builder.append_null();
                 } else {
                     let format = formats.value(i);
                     let format = postgres_datetime_format_to_iso(format.to_string())
                         .replace("TZ", &timezone);
 
-                    let secs = duration.num_seconds();
-                    let nanosecs = duration.num_nanoseconds().unwrap_or(0) - secs * 1_000_000_000;
-                    let timestamp = ::chrono::DateTime::from_timestamp(secs, nanosecs as u32)
-                        .map(|dt| dt.naive_utc())
-                        .unwrap_or_else(|| panic!("Invalid secs {} nanosecs {}", secs, nanosecs));
+                    let timestamp = to_datetime(value).ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "Timestamp {} is out of range for to_char",
+                            value
+                        ))
+                    })?;
 
-                    // chrono's strftime is missing quarter format, as such a workaround is required
-                    let quarter = &format!("{}", timestamp.date().month0() / 3 + 1);
-                    let format = format.replace("%q", quarter);
+                    // strftime's `%.f` prints as few digits as the fraction needs, while the
+                    // expected width is whole milli-, micro- or nanoseconds.
+                    let format = format.replace("%.f", &SubsecFraction(timestamp).to_string());
 
-                    builder.append_value(timestamp.format(&format).to_string());
+                    let formatted = strtime::format(&format, timestamp).map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "Error evaluating to_char with format '{}': {}",
+                            format, e
+                        ))
+                    })?;
+                    builder.append_value(formatted);
                 }
             }
 
@@ -2475,35 +2481,21 @@ macro_rules! generate_series_udtf {
 
 macro_rules! generate_series_helper_date32 {
     ($CURRENT:ident, $STEP:ident, $PRIMITIVE_TYPE: ident) => {
-        let current_dt = ::chrono::DateTime::from_timestamp(($CURRENT as i64) * 86400, 0)
-            .map(|dt| dt.naive_utc())
-            .ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "Cannot convert date to NaiveDateTime: {}",
-                    $CURRENT
-                ))
+        let current_dt =
+            <Date32Type as DateTimeNative>::to_datetime($CURRENT).ok_or_else(|| {
+                DataFusionError::Execution(format!("Cannot convert date to DateTime: {}", $CURRENT))
             })?;
         let res = date_addsub_month_day_nano(current_dt, $STEP, true)?;
-        $CURRENT = (res.and_utc().timestamp() / 86400) as $PRIMITIVE_TYPE;
+        $CURRENT = (unix_seconds(res) / 86400) as $PRIMITIVE_TYPE;
     };
 }
 
 macro_rules! generate_series_helper_timestamp {
     ($CURRENT:ident, $STEP:ident, $PRIMITIVE_TYPE: ident) => {
-        let current_dt = ::chrono::DateTime::from_timestamp(
-            ($CURRENT as i64) / 1_000_000_000,
-            ($CURRENT % 1_000_000_000) as u32,
-        )
-        .map(|dt| dt.naive_utc())
-        .ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "Cannot convert timestamp to NaiveDateTime: {}",
-                $CURRENT
-            ))
-        })?;
+        let current_dt = datetime_from_unix_nanos($CURRENT);
         let res = date_addsub_month_day_nano(current_dt, $STEP, true)?;
         // A step past 2262-04-11 has no nanosecond timestamp, so it is also past `end`: stop.
-        let Some(next) = res.and_utc().timestamp_nanos_opt() else {
+        let Some(next) = unix_nanos(res) else {
             break;
         };
         $CURRENT = next as $PRIMITIVE_TYPE;
@@ -3584,15 +3576,12 @@ pub fn create_date_to_timestamp_udf() -> ScalarUDF {
                             const NANOSECONDS_IN_DAY: i64 = 86_400_000_000_000;
                             (date as i64)
                                 .checked_mul(NANOSECONDS_IN_DAY)
-                                .ok_or_else(|| {
-                                    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                                    match epoch.checked_add_signed(Duration::days(date as i64)) {
-                                        Some(date) => date_out_of_timestamp_range(date),
-                                        None => date_out_of_timestamp_range(format!(
-                                            "{} days from 1970-01-01",
-                                            date
-                                        )),
-                                    }
+                                .ok_or_else(|| match date_from_unix_days(date) {
+                                    Some(date) => date_out_of_timestamp_range(date),
+                                    None => date_out_of_timestamp_range(format!(
+                                        "{} days from 1970-01-01",
+                                        date
+                                    )),
                                 })
                         })
                         .transpose()
@@ -3608,16 +3597,9 @@ pub fn create_date_to_timestamp_udf() -> ScalarUDF {
                     .iter()
                     .map(|date| match date {
                         Some(date) => {
-                            let date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                            let date = Date::strptime("%Y-%m-%d", date)
                                 .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-                            let time = NaiveTime::from_hms_opt(0, 0, 0).ok_or(
-                                DataFusionError::Execution(
-                                    "Cannot initalize default zero NaiveTime".to_string(),
-                                ),
-                            )?;
-                            NaiveDateTime::new(date, time)
-                                .and_utc()
-                                .timestamp_nanos_opt()
+                            unix_nanos(date.to_datetime(Time::midnight()))
                                 .ok_or_else(|| date_out_of_timestamp_range(date))
                                 .map(Some)
                         }
@@ -3895,17 +3877,19 @@ pub fn create_age_udf() -> ScalarUDF {
 
             let older_dates =
                 downcast_primitive_arg!(args[0], "older_date", TimestampNanosecondType);
-            let current_date = Utc::now().date_naive().and_time(NaiveTime::default());
+            let current_date = Offset::UTC
+                .to_datetime(Timestamp::now())
+                .date()
+                .to_datetime(Time::midnight());
 
             let result = older_dates
                 .iter()
                 .map(|older_date| {
                     older_date
                         .map(|older_date| {
-                            let older_date = timestamp_ns_to_datetime_checked(older_date)?;
                             timestamp_difference_to_interval_month_day_nano(
                                 current_date,
-                                older_date,
+                                datetime_from_unix_nanos(older_date),
                             )
                         })
                         .transpose()
@@ -3925,10 +3909,11 @@ pub fn create_age_udf() -> ScalarUDF {
                 .zip(older_dates)
                 .map(|dates| match dates {
                     (Some(newer_date), Some(older_date)) => {
-                        let newer_date = timestamp_ns_to_datetime_checked(newer_date)?;
-                        let older_date = timestamp_ns_to_datetime_checked(older_date)?;
-                        timestamp_difference_to_interval_month_day_nano(newer_date, older_date)
-                            .map(Some)
+                        timestamp_difference_to_interval_month_day_nano(
+                            datetime_from_unix_nanos(newer_date),
+                            datetime_from_unix_nanos(older_date),
+                        )
+                        .map(Some)
                     }
                     _ => Ok(None),
                 })
@@ -3969,15 +3954,9 @@ pub fn create_age_udf() -> ScalarUDF {
     )
 }
 
-fn timestamp_ns_to_datetime_checked(v: i64) -> Result<NaiveDateTime> {
-    timestamp_ns_to_datetime(v).ok_or_else(|| {
-        DataFusionError::Execution(format!("Cannot convert timestamp to NaiveDateTime: {}", v))
-    })
-}
-
 fn timestamp_difference_to_interval_month_day_nano(
-    newer_date: NaiveDateTime,
-    older_date: NaiveDateTime,
+    newer_date: DateTime,
+    older_date: DateTime,
 ) -> Result<IntervalMonthDayNano> {
     if newer_date == older_date {
         return Ok(IntervalMonthDayNanoType::make_value(0, 0, 0));
@@ -3991,8 +3970,8 @@ fn timestamp_difference_to_interval_month_day_nano(
         false
     };
 
-    let years = newer_date.year() - older_date.year();
-    let mut months: i32 = (newer_date.month() as i32) - (older_date.month() as i32);
+    let years = i32::from(newer_date.year()) - i32::from(older_date.year());
+    let mut months: i32 = i32::from(newer_date.month()) - i32::from(older_date.month());
     months += years * 12;
     if newer_date.day() < older_date.day()
         || (newer_date.day() == older_date.day() && newer_date.time() < older_date.time())
@@ -4000,20 +3979,17 @@ fn timestamp_difference_to_interval_month_day_nano(
         months -= 1;
     }
 
-    let offset_older_date = older_date
-        .checked_add_months(Months::new(months as u32))
+    let offset_older_date = add_months(older_date, i64::from(months))
         .ok_or_else(|| DataFusionError::Execution("Cannot add months to date".to_string()))?;
-    let duration = newer_date - offset_older_date;
-    let mut days: i32 = duration
-        .num_days()
+    let duration = newer_date.duration_since(offset_older_date);
+    let mut days: i32 = (duration.as_hours() / 24)
         .try_into()
         .map_err(|_| DataFusionError::Execution("Cannot convert days to i32".to_string()))?;
 
-    let offset_older_date = offset_older_date
-        .checked_add_days(Days::new(days as u64))
+    let offset_older_date = add_days(offset_older_date, i64::from(days))
         .ok_or_else(|| DataFusionError::Execution("Cannot add days to date".to_string()))?;
-    let duration = newer_date - offset_older_date;
-    let mut nanos = duration.num_nanoseconds().ok_or_else(|| {
+    let duration = newer_date.duration_since(offset_older_date);
+    let mut nanos: i64 = duration.as_nanos().try_into().map_err(|_| {
         DataFusionError::Execution("Cannot convert duration to nanoseconds".to_string())
     })?;
 
@@ -4200,8 +4176,9 @@ pub fn create_pg_relation_size_udf() -> ScalarUDF {
 }
 
 pub fn create_pg_postmaster_start_time_udf() -> ScalarUDF {
-    let fun_registration_nanos = Utc::now()
-        .timestamp_nanos_opt()
+    let fun_registration_nanos: i64 = Timestamp::now()
+        .as_nanosecond()
+        .try_into()
         .expect("Unable to get current time as nanoseconds");
 
     let fun = make_scalar_function(move |_args: &[ArrayRef]| {

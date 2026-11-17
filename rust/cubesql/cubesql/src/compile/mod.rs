@@ -46,13 +46,13 @@ mod tests {
         },
         CubeError,
     };
-    use chrono::{Datelike, Duration, Utc};
     use cubeclient::models::{
         V1LoadRequestQuery, V1LoadRequestQueryFilterItem, V1LoadRequestQueryTimeDimension,
         V1LoadResponse, V1LoadResult, V1LoadResultAnnotation, V1LoadResultDataColumnar,
     };
     use datafusion::{arrow::datatypes::DataType, physical_plan::displayable};
     use itertools::Itertools;
+    use jiff::{civil::Date, tz::Offset, Timestamp, ToSpan};
     use pretty_assertions::assert_eq;
     use regex::Regex;
     use serde_json::json;
@@ -63,6 +63,10 @@ mod tests {
         convert_select_to_query_plan_with_meta, execute_queries_with_flags, execute_query,
         init_testing_logger, member_expression_sql, LogicalPlanTestUtils, TestContext,
     };
+
+    fn utc_today() -> Date {
+        Offset::UTC.to_datetime(Timestamp::now()).date()
+    }
 
     #[tokio::test]
     async fn test_select_measure_via_function() {
@@ -9232,8 +9236,7 @@ ORDER BY "source"."str0" ASC
         .await
         .as_logical_plan();
 
-        let now = chrono::Utc::now();
-        let current_year = now.naive_utc().date().year();
+        let current_year = utc_today().year();
         assert_eq!(
             logical_plan.find_cube_scan().request,
             V1LoadRequestQuery {
@@ -10121,7 +10124,7 @@ ORDER BY "source"."str0" ASC
         .await
         .as_logical_plan();
 
-        let end_date = chrono::Utc::now().date_naive() - chrono::Duration::days(5);
+        let end_date = utc_today() - 5.days();
         assert_eq!(
             logical_plan.find_cube_scan().request,
             V1LoadRequestQuery {
@@ -10173,11 +10176,9 @@ ORDER BY "source"."str0" ASC
         .await
         .as_logical_plan();
 
-        let now = chrono::Utc::now();
-        let duration_sub_weeks = chrono::Duration::weeks(4);
-        let duration_sub_days =
-            chrono::Duration::days(now.weekday().num_days_from_sunday() as i64 + 1);
-        let end_date = now.date_naive() - duration_sub_weeks - duration_sub_days;
+        let today = utc_today();
+        let days_since_sunday = i64::from(today.weekday().to_sunday_zero_offset());
+        let end_date = today - 4.weeks() - (days_since_sunday + 1).days();
         assert_eq!(
             logical_plan.find_cube_scan().request,
             V1LoadRequestQuery {
@@ -13613,8 +13614,8 @@ ORDER BY "source"."str0" ASC
 
         let logical_plan = query_plan.as_logical_plan();
 
-        let today = Utc::now().date_naive();
-        let thirty_days_ago = today - Duration::days(30);
+        let today = utc_today();
+        let thirty_days_ago = today - 30.days();
         let format_str = "%Y-%m-%d";
         assert_eq!(
             logical_plan.find_cube_scan_wrapped_sql().request,
@@ -13650,7 +13651,7 @@ ORDER BY "source"."str0" ASC
                         "expr": {
                             "type": "SqlFunction",
                             "cubeParams": ["KibanaSampleDataEcommerce"],
-                            "sql": format!("(((${{KibanaSampleDataEcommerce.order_date}} >= timestamptz '{}T00:00:00.000Z') AND (${{KibanaSampleDataEcommerce.order_date}} < timestamptz '{}T00:00:00.000Z')) AND (((${{KibanaSampleDataEcommerce.notes}} = $0$) OR (${{KibanaSampleDataEcommerce.notes}} = $1$)) OR (${{KibanaSampleDataEcommerce.notes}} = $2$)))", thirty_days_ago.format(format_str), today.format(format_str)),
+                            "sql": format!("(((${{KibanaSampleDataEcommerce.order_date}} >= timestamptz '{}T00:00:00.000Z') AND (${{KibanaSampleDataEcommerce.order_date}} < timestamptz '{}T00:00:00.000Z')) AND (((${{KibanaSampleDataEcommerce.notes}} = $0$) OR (${{KibanaSampleDataEcommerce.notes}} = $1$)) OR (${{KibanaSampleDataEcommerce.notes}} = $2$)))", thirty_days_ago.strftime(format_str), today.strftime(format_str)),
                         },
                         "groupingSet": null,
                     }).to_string(),

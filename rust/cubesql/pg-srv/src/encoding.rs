@@ -108,8 +108,8 @@ impl_primitive!(f64);
 mod tests {
     use crate::*;
     use bytes::BytesMut;
-    #[cfg(feature = "with-chrono")]
-    use chrono::NaiveDate;
+    #[cfg(feature = "with-jiff")]
+    use jiff::civil::Date;
 
     fn assert_text_encode<T: ToProtocolValue>(value: T, expected: &[u8]) {
         let mut buf = BytesMut::new();
@@ -140,7 +140,7 @@ mod tests {
             ],
         );
 
-        #[cfg(feature = "with-chrono")]
+        #[cfg(feature = "with-jiff")]
         {
             // Test TimestampValue encoding
             assert_text_encode(
@@ -158,23 +158,23 @@ mod tests {
                 ],
             );
 
-            // Test NaiveDate encoding
+            // Test Date encoding
             assert_text_encode(
-                NaiveDate::from_ymd_opt(2025, 8, 8).unwrap(),
+                Date::constant(2025, 8, 8),
                 &[
                     0, 0, 0, 10, // length: 10 bytes
                     50, 48, 50, 53, 45, 48, 56, 45, 48, 56, // "2025-08-08"
                 ],
             );
             assert_text_encode(
-                NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(),
+                Date::constant(2000, 1, 1),
                 &[
                     0, 0, 0, 10, // length: 10 bytes
                     50, 48, 48, 48, 45, 48, 49, 45, 48, 49, // "2000-01-01"
                 ],
             );
             assert_text_encode(
-                NaiveDate::from_ymd_opt(1999, 12, 31).unwrap(),
+                Date::constant(1999, 12, 31),
                 &[
                     0, 0, 0, 10, // length: 10 bytes
                     49, 57, 57, 57, 45, 49, 50, 45, 51, 49, // "1999-12-31"
@@ -207,7 +207,7 @@ mod tests {
             ],
         );
 
-        #[cfg(feature = "with-chrono")]
+        #[cfg(feature = "with-jiff")]
         {
             // Test TimestampValue binary encoding
             assert_bind_encode(
@@ -219,10 +219,10 @@ mod tests {
                 &[0, 0, 0, 8, 0, 2, 128, 120, 159, 252, 216, 128],
             );
 
-            // Test NaiveDate binary encoding
+            // Test Date binary encoding
             // PostgreSQL epoch is 2000-01-01, so this date should be 0 days
             assert_bind_encode(
-                NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(),
+                Date::constant(2000, 1, 1),
                 &[
                     0, 0, 0, 4, // length: 4 bytes
                     0, 0, 0, 0, // 0 days from epoch
@@ -230,7 +230,7 @@ mod tests {
             );
             // Date after epoch: 2025-08-08 is 9351 days after 2000-01-01
             assert_bind_encode(
-                NaiveDate::from_ymd_opt(2025, 8, 8).unwrap(),
+                Date::constant(2025, 8, 8),
                 &[
                     0, 0, 0, 4, // length: 4 bytes
                     0, 0, 36, 135, // 9351 days from epoch (0x2487 in hex)
@@ -238,7 +238,7 @@ mod tests {
             );
             // Date before epoch: 1999-12-31 is -1 day from 2000-01-01
             assert_bind_encode(
-                NaiveDate::from_ymd_opt(1999, 12, 31).unwrap(),
+                Date::constant(1999, 12, 31),
                 &[
                     0, 0, 0, 4, // length: 4 bytes
                     255, 255, 255, 255, // -1 in two's complement

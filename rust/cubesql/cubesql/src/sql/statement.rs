@@ -2226,8 +2226,8 @@ mod tests {
             "SELECT * FROM orders WHERE order_date >= $1 AND order_date <= $2",
             "SELECT * FROM orders WHERE order_date >= '1999-12-31' AND order_date <= '2000-01-01'",
             vec![
-                BindValue::Date(DateValue::from_ymd_opt(1999, 12, 31).unwrap()),
-                BindValue::Date(DateValue::from_ymd_opt(2000, 1, 1).unwrap()),
+                BindValue::Date(DateValue::constant(1999, 12, 31)),
+                BindValue::Date(DateValue::constant(2000, 1, 1)),
             ],
         )?;
 

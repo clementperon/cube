@@ -7,6 +7,7 @@ use datafusion::{
     physical_plan::displayable,
     scalar::ScalarValue,
 };
+use jiff::{tz::Offset, Timestamp, ToSpan};
 use pretty_assertions::assert_eq;
 use regex::Regex;
 use serde_json::json;
@@ -5227,12 +5228,12 @@ async fn test_binary_expr_computed_date_bound_cube_scan_filter() {
     // Midnight 28 days before the plan-time (UTC) date. The test may straddle midnight, so
     // the previous day is accepted too.
     let values = filters[0].values.clone().unwrap();
-    let today = chrono::Utc::now().date_naive();
-    let expected = [today, today - chrono::Duration::days(1)]
+    let today = Offset::UTC.to_datetime(Timestamp::now()).date();
+    let expected = [today, today - 1.day()]
         .iter()
         .map(|day| {
-            (*day - chrono::Duration::days(28))
-                .format("%Y-%m-%dT00:00:00.000Z")
+            (*day - 28.days())
+                .strftime("%Y-%m-%dT00:00:00.000Z")
                 .to_string()
         })
         .collect::<Vec<_>>();

@@ -4,8 +4,6 @@
 
 use std::{collections::HashMap, ops::ControlFlow, sync::Arc};
 
-use chrono::DateTime;
-
 use datafusion::{
     arrow::{
         compute::kernels::cast_utils::string_to_timestamp_nanos,
@@ -39,7 +37,11 @@ use super::{
 };
 use itertools::Itertools;
 
-use crate::{sql::Session, transport::MetaContext};
+use crate::{
+    sql::Session,
+    transport::MetaContext,
+    utils::datetime::{datetime_from_unix_nanos, SubsecFraction},
+};
 
 /// Name of the stand-in function placeholders are planned as when describing parameters.
 const PARAMETER_UDF: &str = "__cube_parameter";
@@ -211,10 +213,12 @@ fn prepare_value(param: &ParameterValue) -> CompilationResult<BoundValue<'_>> {
         (ParameterValueType::Time, Json::String(s)) => {
             // Bound as UTC without an offset, which a data source can't drop or reinterpret
             let nanos = string_to_timestamp_nanos(s).map_err(|_| invalid())?;
-            let utc = DateTime::from_timestamp_nanos(nanos)
-                .naive_utc()
-                .format("%Y-%m-%dT%H:%M:%S%.f")
-                .to_string();
+            let utc = datetime_from_unix_nanos(nanos);
+            let utc = format!(
+                "{}{}",
+                utc.strftime("%Y-%m-%dT%H:%M:%S"),
+                SubsecFraction(utc)
+            );
             BoundValue::Literal(Box::new(Expr::Cast {
                 kind: ast::CastKind::Cast,
                 expr: Box::new(Expr::Value(

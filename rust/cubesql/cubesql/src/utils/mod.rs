@@ -1,3 +1,5 @@
+pub mod datetime;
+
 use crate::compile::rewrite::rewriter::CubeEGraph;
 use datafusion::scalar::ScalarValue;
 use sha2::{Digest, Sha256};

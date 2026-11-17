@@ -1,4 +1,3 @@
-use chrono::prelude::*;
 use comfy_table::{Cell, Table};
 use datafusion::arrow::{
     array::{
@@ -11,12 +10,16 @@ use datafusion::arrow::{
     datatypes::{DataType, IntervalDayTime, IntervalMonthDayNano, IntervalUnit, Schema, TimeUnit},
     record_batch::RecordBatch,
 };
+use jiff::civil::Date;
 use rust_decimal::prelude::*;
 use serde::{Serialize, Serializer};
 use std::fmt::{self, Debug};
 
 use super::{ColumnFlags, ColumnType};
-use crate::CubeError;
+use crate::{
+    utils::datetime::{date_from_unix_days, datetime_from_unix_millis},
+    CubeError,
+};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Column {
@@ -91,7 +94,7 @@ pub enum TableValue {
     Float64(f64),
     List(ListValue),
     Decimal128(Decimal128Value),
-    Date(NaiveDate),
+    Date(Date),
     Timestamp(TimestampValue),
     Interval(IntervalValue),
 }
@@ -464,9 +467,13 @@ pub fn batches_to_dataframe(
                         rows[i].push(if a.is_null(i) {
                             TableValue::Null
                         } else {
-                            TableValue::Date(a.value_as_date(i).expect(
-                                "value_as_date must return Option with NaiveDate for Date32Array",
-                            ))
+                            let days = a.value(i);
+                            TableValue::Date(date_from_unix_days(days).ok_or_else(|| {
+                                CubeError::internal(format!(
+                                    "Date {} days from 1970-01-01 is out of range",
+                                    days
+                                ))
+                            })?)
                         });
                     }
                 }
@@ -476,9 +483,14 @@ pub fn batches_to_dataframe(
                         rows[i].push(if a.is_null(i) {
                             TableValue::Null
                         } else {
-                            TableValue::Date(a.value_as_date(i).expect(
-                                "value_as_date must return Option with NaiveDate for Date64Array",
-                            ))
+                            let millis = a.value(i);
+                            let date = datetime_from_unix_millis(millis).ok_or_else(|| {
+                                CubeError::internal(format!(
+                                    "Date {} milliseconds from 1970-01-01 is out of range",
+                                    millis
+                                ))
+                            })?;
+                            TableValue::Date(date.date())
                         });
                     }
                 }
@@ -707,7 +719,7 @@ mod tests {
                 TableValue::Decimal128(Decimal128Value::new(123456789, 2)),
                 TableValue::Timestamp(TimestampValue::new(737942400 * 1_000_000_000, None)),
                 TableValue::Interval(IntervalValue::new(1, 2, 3, 4, 5, 6)),
-                TableValue::Date(NaiveDate::from_ymd_opt(1993, 5, 21).unwrap()),
+                TableValue::Date(Date::constant(1993, 5, 21)),
             ])],
         );
 

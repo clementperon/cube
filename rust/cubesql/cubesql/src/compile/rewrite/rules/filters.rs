@@ -28,31 +28,24 @@ use crate::{
     config::ConfigObj,
     copy_value,
     transport::{ext::V1CubeMetaExt, MemberType, MetaContext},
+    utils::datetime::{
+        date_from_unix_days, datetime_from_unix_micros, datetime_from_unix_millis,
+        datetime_from_unix_nanos, datetime_from_unix_seconds, unix_millis, unix_nanos,
+    },
     var, var_iter,
 };
 use bigdecimal::{num_bigint::BigInt, BigDecimal};
-use chrono::{
-    format::{
-        Fixed, Item,
-        Numeric::{Day, Hour, Minute, Month, Second, Year},
-        Pad::Zero,
-    },
-    DateTime, Datelike, Days, Duration, Months, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc,
-    Weekday,
-};
 use cubeclient::models::V1CubeMeta;
 use datafusion::{
-    arrow::{
-        array::{
-            Date32Array, Date64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
-            TimestampNanosecondArray, TimestampSecondArray,
-        },
-        datatypes::{DataType, IntervalDayTimeType},
-    },
+    arrow::datatypes::{DataType, IntervalDayTimeType},
     logical_plan::{Column, Expr, Operator},
     scalar::ScalarValue,
 };
 use egg::{Subst, Var};
+use jiff::{
+    civil::{Date, DateTime, Time, Weekday},
+    SignedDuration, ToSpan,
+};
 use std::{
     collections::HashSet,
     convert::TryInto,
@@ -3804,9 +3797,9 @@ impl FilterRules {
                                         | ScalarValue::Date32(_)
                                         | ScalarValue::Date64(_) => {
                                             if let Ok(Some(timestamp)) =
-                                                Self::scalar_to_native_datetime(&literal)
+                                                Self::scalar_to_filter_instant(&literal)
                                             {
-                                                let value = format_iso_timestamp(timestamp);
+                                                let value = timestamp.to_string();
 
                                                 match expr_op {
                                                     // TODO: all other operators need special granularity handlers like Eq
@@ -3816,9 +3809,16 @@ impl FilterRules {
                                                     Operator::GtEq => vec![value],
                                                     Operator::Eq => {
                                                         if let Some(granularity) = granularity {
+                                                            let FilterInstant::At(timestamp) =
+                                                                timestamp
+                                                            else {
+                                                                continue;
+                                                            };
                                                             if let Some((_, end)) = Self::naive_datetime_to_range_by_granularity(timestamp, &granularity) {
-                                                                let end = format_iso_timestamp(end.checked_sub_signed(Duration::milliseconds(1)).unwrap());
-                                                                vec![value, end]
+                                                                let Some(end) = end.sub_millisecond() else {
+                                                                    continue;
+                                                                };
+                                                                vec![value, format_iso_timestamp(end)]
                                                             } else {
                                                                 continue;
                                                             }
@@ -4343,8 +4343,8 @@ impl FilterRules {
                         return None;
                     }
                     // Only date formats are supported for now, no timestamps
-                    let start_date = NaiveDate::parse_from_str(&values[0], "%Y-%m-%d").ok()?;
-                    let end_date = NaiveDate::parse_from_str(&values[1], "%Y-%m-%d").ok()?;
+                    let start_date = Date::strptime("%Y-%m-%d", &values[0]).ok()?;
+                    let end_date = Date::strptime("%Y-%m-%d", &values[1]).ok()?;
                     Some((start_date, end_date))
                 })
             else {
@@ -4387,8 +4387,8 @@ impl FilterRules {
             };
 
             let new_values = vec![
-                new_start_date.format("%Y-%m-%d").to_string(),
-                new_end_date.format("%Y-%m-%d").to_string(),
+                new_start_date.strftime("%Y-%m-%d").to_string(),
+                new_end_date.strftime("%Y-%m-%d").to_string(),
             ];
 
             subst.insert(
@@ -4709,8 +4709,8 @@ impl FilterRules {
             | ScalarValue::TimestampSecond(_, _)
             | ScalarValue::Date32(_)
             | ScalarValue::Date64(_) => {
-                if let Some(timestamp) = Self::scalar_to_native_datetime(literal)? {
-                    format_iso_timestamp(timestamp)
+                if let Some(timestamp) = Self::scalar_to_filter_instant(literal)? {
+                    timestamp.to_string()
                 } else {
                     log::trace!("Unsupported filter scalar: {literal:?}");
                     return Err("Unsupported filter scalar");
@@ -4723,48 +4723,41 @@ impl FilterRules {
         })
     }
 
-    fn scalar_to_native_datetime(
-        literal: &ScalarValue,
-    ) -> Result<Option<NaiveDateTime>, &'static str> {
-        Ok(match literal {
-            // Plan normalization folds a date too far out for nanoseconds (`9999-12-31`) to a
-            // millisecond timestamp, so the coarser units are accepted here as well.
-            ScalarValue::TimestampNanosecond(_, _)
-            | ScalarValue::TimestampMicrosecond(_, _)
-            | ScalarValue::TimestampMillisecond(_, _)
-            | ScalarValue::TimestampSecond(_, _)
-            | ScalarValue::Date32(_)
-            | ScalarValue::Date64(_) => {
-                // `value_as_datetime` ignores validity, so a NULL would read as the epoch.
-                if literal.is_null() {
-                    return Ok(None);
-                }
-                let array = literal.to_array();
-                let timestamp = if let Some(array) =
-                    array.as_any().downcast_ref::<TimestampNanosecondArray>()
-                {
-                    array.value_as_datetime(0)
-                } else if let Some(array) =
-                    array.as_any().downcast_ref::<TimestampMicrosecondArray>()
-                {
-                    array.value_as_datetime(0)
-                } else if let Some(array) =
-                    array.as_any().downcast_ref::<TimestampMillisecondArray>()
-                {
-                    array.value_as_datetime(0)
-                } else if let Some(array) = array.as_any().downcast_ref::<TimestampSecondArray>() {
-                    array.value_as_datetime(0)
-                } else if let Some(array) = array.as_any().downcast_ref::<Date32Array>() {
-                    array.value_as_datetime(0)
-                } else if let Some(array) = array.as_any().downcast_ref::<Date64Array>() {
-                    array.value_as_datetime(0)
-                } else {
-                    log::trace!("Unexpected array type: {:?}", array.data_type());
-                    return Err("Unexpected array type");
-                };
+    /// The datetime of a date/time literal. A NULL, like a value no datetime can hold, is `None`.
+    fn scalar_to_native_datetime(literal: &ScalarValue) -> Result<Option<DateTime>, &'static str> {
+        Ok(match Self::scalar_to_filter_instant(literal)? {
+            Some(FilterInstant::At(datetime)) => Some(datetime),
+            Some(FilterInstant::EndOfTime) | None => None,
+        })
+    }
 
-                timestamp
+    /// The instant of a date/time literal. A NULL, like a value that is neither a datetime nor
+    /// the end of time, is `None`.
+    fn scalar_to_filter_instant(
+        literal: &ScalarValue,
+    ) -> Result<Option<FilterInstant>, &'static str> {
+        // Plan normalization folds a date too far out for nanoseconds (`9999-12-31`) to a
+        // millisecond timestamp, so the coarser units are accepted here as well.
+        Ok(match literal {
+            ScalarValue::TimestampNanosecond(value, _) => {
+                value.map(|nanos| FilterInstant::At(datetime_from_unix_nanos(nanos)))
             }
+            ScalarValue::TimestampMicrosecond(value, _) => value.and_then(|micros| {
+                FilterInstant::from_unix(micros, 86_400_000_000, datetime_from_unix_micros)
+            }),
+            ScalarValue::TimestampMillisecond(value, _) | ScalarValue::Date64(value) => value
+                .and_then(|millis| {
+                    FilterInstant::from_unix(millis, 86_400_000, datetime_from_unix_millis)
+                }),
+            ScalarValue::TimestampSecond(value, _) => value.and_then(|seconds| {
+                FilterInstant::from_unix(seconds, 86_400, datetime_from_unix_seconds)
+            }),
+            ScalarValue::Date32(value) => value.and_then(|days| {
+                FilterInstant::from_unix(days.into(), 1, |days| {
+                    let date = date_from_unix_days(days.try_into().ok()?)?;
+                    Some(date.to_datetime(Time::midnight()))
+                })
+            }),
             x => {
                 log::trace!("Unsupported filter scalar: {x:?}");
                 return Err("Unsupported filter scalar");
@@ -5328,7 +5321,7 @@ impl FilterRules {
             subst.insert(
                 end_date_var,
                 egraph.add(LogicalPlanLanguage::LiteralExprValue(LiteralExprValue(
-                    Self::naive_datetime_to_timestamp_literal(end_date),
+                    end_date.to_timestamp_literal(),
                 ))),
             );
             true
@@ -5374,25 +5367,13 @@ impl FilterRules {
             }
 
             fn increment_iso_timestamp_time(date_var: &String) -> Option<String> {
-                let timestamp = parse_date_str(date_var);
-                let value = match timestamp {
-                    Ok(val) => format_iso_timestamp(
-                        val.checked_add_signed(Duration::milliseconds(1)).unwrap(),
-                    ),
-                    Err(_) => return None,
-                };
-                return Some(value);
+                let timestamp = FilterInstant::parse(date_var)?;
+                return Some(timestamp.add_millisecond().to_string());
             }
 
             fn decrement_iso_timestamp_time(date_var: &String) -> Option<String> {
-                let timestamp = parse_date_str(date_var);
-                let value = match timestamp {
-                    Ok(val) => format_iso_timestamp(
-                        val.checked_sub_signed(Duration::milliseconds(1)).unwrap(),
-                    ),
-                    Err(_) => return None,
-                };
-                return Some(value);
+                let timestamp = FilterInstant::parse(date_var)?;
+                return Some(format_iso_timestamp(timestamp.sub_millisecond()?));
             }
 
             for date_range_start in
@@ -5788,7 +5769,7 @@ impl FilterRules {
 
     /// Converts a date/time literal to a datetime. String literals are parsed with Cube's date
     /// parser to also support date-only strings (e.g. `'2019-01-01'`).
-    fn filter_scalar_to_naive_datetime(literal: &ScalarValue) -> Option<NaiveDateTime> {
+    fn filter_scalar_to_naive_datetime(literal: &ScalarValue) -> Option<DateTime> {
         match literal {
             ScalarValue::Utf8(Some(value)) => parse_date_str(value).ok(),
             _ => Self::scalar_to_native_datetime(literal).ok()?,
@@ -5850,10 +5831,7 @@ impl FilterRules {
                 };
                 // A member filter value is a four-digit-year ISO string, so 9999-12-31 has no
                 // next day to bound it; the predicate is pushed down as SQL instead.
-                let Some(next_day_start) = day_start
-                    .checked_add_signed(Duration::days(1))
-                    .filter(|next_day_start| next_day_start.year() <= 9999)
-                else {
+                let Ok(next_day_start) = day_start.checked_add(1.day()) else {
                     continue;
                 };
 
@@ -5949,14 +5927,14 @@ impl FilterRules {
                         Self::naive_datetime_to_range_by_granularity(value, granularity)
                     });
 
-                    let mut dts: Vec<(NaiveDateTime, NaiveDateTime)> = vec![];
-                    let mut last_value: Option<(NaiveDateTime, NaiveDateTime)> = None;
+                    let mut dts: Vec<(DateTime, FilterInstant)> = vec![];
+                    let mut last_value: Option<(DateTime, FilterInstant)> = None;
                     for (next_value_from, next_value_to) in values {
                         let Some((last_value_from, last_value_to)) = last_value else {
                             last_value = Some((next_value_from, next_value_to));
                             continue;
                         };
-                        if last_value_to == next_value_from {
+                        if last_value_to == FilterInstant::At(next_value_from) {
                             last_value = Some((last_value_from, next_value_to));
                             continue;
                         }
@@ -5968,18 +5946,19 @@ impl FilterRules {
                     }
 
                     let format = "%Y-%m-%dT%H:%M:%S%.3fZ";
-                    let dts = dts
+                    let Some(dts) = dts
                         .into_iter()
                         .map(|(dt, new_dt)| {
-                            let new_dt = new_dt
-                                .checked_sub_signed(Duration::milliseconds(1))
-                                .unwrap();
-                            (
-                                dt.format(format).to_string(),
-                                new_dt.format(format).to_string(),
-                            )
+                            let new_dt = new_dt.sub_millisecond()?;
+                            Some((
+                                dt.strftime(format).to_string(),
+                                new_dt.strftime(format).to_string(),
+                            ))
                         })
-                        .collect::<Vec<_>>();
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        continue;
+                    };
                     let len = dts.len();
                     if len < 1 {
                         continue;
@@ -6087,26 +6066,19 @@ impl FilterRules {
 
     /// A timestamp literal for a date range bound: nanoseconds where they reach, milliseconds
     /// beyond 2262-04-11, which filter rules accept as well.
-    fn naive_datetime_to_timestamp_literal(dt: NaiveDateTime) -> ScalarValue {
-        let dt = dt.and_utc();
-        match dt.timestamp_nanos_opt() {
+    fn naive_datetime_to_timestamp_literal(dt: DateTime) -> ScalarValue {
+        match unix_nanos(dt) {
             Some(nanos) => ScalarValue::TimestampNanosecond(Some(nanos), None),
-            None => ScalarValue::TimestampMillisecond(Some(dt.timestamp_millis()), None),
+            None => ScalarValue::TimestampMillisecond(Some(unix_millis(dt)), None),
         }
     }
 
     // The outer Option's purpose is to signal when the type is incorrect
     // or parsing couldn't interpret the value as a NativeDateTime.
     // The inner Option is None when the ScalarValue is None.
-    fn scalar_dt_to_naive_datetime(literal: &ScalarValue) -> Option<Option<NaiveDateTime>> {
+    fn scalar_dt_to_naive_datetime(literal: &ScalarValue) -> Option<Option<DateTime>> {
         if let ScalarValue::TimestampNanosecond(ts, None) = literal {
-            let Some(ts) = ts else {
-                return Some(None);
-            };
-            let ts_seconds = *ts / 1_000_000_000;
-            let ts_nanos = (*ts % 1_000_000_000) as u32;
-            let dt = DateTime::from_timestamp(ts_seconds, ts_nanos).map(|dt| Some(dt.naive_utc()));
-            return dt;
+            return Some(ts.map(datetime_from_unix_nanos));
         };
         // Same units as `scalar_to_native_datetime`.
         if let ScalarValue::TimestampMicrosecond(_, None)
@@ -6147,35 +6119,39 @@ impl FilterRules {
         };
 
         // Cancel on conversion errors
-        let year = if has_day {
+        let year: i32 = if has_day {
             *value / 10000
         } else {
             *value / 100
         }
         .try_into()
         .ok()?;
-        let month = if has_day {
+        let month: u32 = if has_day {
             (*value / 100) % 100
         } else {
             *value % 100
         }
         .try_into()
         .ok()?;
-        let day = if has_day { *value % 100 } else { 1 }.try_into().ok()?;
-        let Some(date) = NaiveDate::from_ymd_opt(year, month, day) else {
+        let day: u32 = if has_day { *value % 100 } else { 1 }.try_into().ok()?;
+        let date = match (year.try_into(), month.try_into(), day.try_into()) {
+            (Ok(year), Ok(month), Ok(day)) => Date::new(year, month, day).ok(),
+            _ => None,
+        };
+        let Some(date) = date else {
             // Date is invalid, skip this value
             return Some(None);
         };
 
-        let datetime = date.and_hms_opt(0, 0, 0)?;
-        let timestamp_nanos = Utc.from_utc_datetime(&datetime).timestamp_nanos_opt()?;
+        let timestamp_nanos = unix_nanos(date.to_datetime(Time::midnight()))?;
         Some(Some(timestamp_nanos))
     }
 
+    /// The unit of `granularity` that `dt` starts, as its first instant and the first one past it.
     fn naive_datetime_to_range_by_granularity(
-        dt: NaiveDateTime,
+        dt: DateTime,
         granularity: &String,
-    ) -> Option<(NaiveDateTime, NaiveDateTime)> {
+    ) -> Option<(DateTime, FilterInstant)> {
         let granularity = granularity.to_lowercase();
 
         // Validate that `dt` is indeed the earliest time of a granularity unit.
@@ -6187,7 +6163,7 @@ impl FilterRules {
                     && dt.hour() == 0
                     && dt.minute() == 0
                     && dt.second() == 0
-                    && dt.nanosecond() == 0
+                    && dt.subsec_nanosecond() == 0
             }
             "quarter" | "qtr" => {
                 matches!(dt.month(), 1 | 4 | 7 | 10)
@@ -6195,26 +6171,31 @@ impl FilterRules {
                     && dt.hour() == 0
                     && dt.minute() == 0
                     && dt.second() == 0
-                    && dt.nanosecond() == 0
+                    && dt.subsec_nanosecond() == 0
             }
             "month" => {
                 dt.day() == 1
                     && dt.hour() == 0
                     && dt.minute() == 0
                     && dt.second() == 0
-                    && dt.nanosecond() == 0
+                    && dt.subsec_nanosecond() == 0
             }
             "week" => {
-                dt.weekday() == Weekday::Mon
+                dt.weekday() == Weekday::Monday
                     && dt.hour() == 0
                     && dt.minute() == 0
                     && dt.second() == 0
-                    && dt.nanosecond() == 0
+                    && dt.subsec_nanosecond() == 0
             }
-            "day" => dt.hour() == 0 && dt.minute() == 0 && dt.second() == 0 && dt.nanosecond() == 0,
-            "hour" => dt.minute() == 0 && dt.second() == 0 && dt.nanosecond() == 0,
-            "minute" => dt.second() == 0 && dt.nanosecond() == 0,
-            "second" => dt.nanosecond() == 0,
+            "day" => {
+                dt.hour() == 0
+                    && dt.minute() == 0
+                    && dt.second() == 0
+                    && dt.subsec_nanosecond() == 0
+            }
+            "hour" => dt.minute() == 0 && dt.second() == 0 && dt.subsec_nanosecond() == 0,
+            "minute" => dt.second() == 0 && dt.subsec_nanosecond() == 0,
+            "second" => dt.subsec_nanosecond() == 0,
             _ => return None,
         };
         if !is_earliest {
@@ -6223,17 +6204,24 @@ impl FilterRules {
 
         let new_dt = dt;
         let new_dt = match granularity.as_str() {
-            "year" => new_dt.checked_add_months(Months::new(12)),
-            "quarter" | "qtr" => new_dt.checked_add_months(Months::new(3)),
-            "month" => new_dt.checked_add_months(Months::new(1)),
-            "week" => new_dt.checked_add_days(Days::new(7)),
-            "day" => new_dt.checked_add_days(Days::new(1)),
-            "hour" => new_dt.checked_add_signed(Duration::hours(1)),
-            "minute" => new_dt.checked_add_signed(Duration::minutes(1)),
-            "second" => new_dt.checked_add_signed(Duration::seconds(1)),
+            "year" => new_dt.checked_add(12.months()),
+            "quarter" | "qtr" => new_dt.checked_add(3.months()),
+            "month" => new_dt.checked_add(1.month()),
+            "week" => new_dt.checked_add(7.days()),
+            "day" => new_dt.checked_add(1.day()),
+            "hour" => new_dt.checked_add(SignedDuration::from_hours(1)),
+            "minute" => new_dt.checked_add(SignedDuration::from_mins(1)),
+            "second" => new_dt.checked_add(SignedDuration::from_secs(1)),
             _ => return None,
         }
-        .expect("Unable to add specified duration to new_dt");
+        .map(FilterInstant::At);
+        // `dt` starts its unit, so the only way out of range is past the last datetime. The last
+        // week runs into year 10000; every other unit ends with 9999-12-31.
+        let new_dt = match new_dt {
+            Ok(new_dt) => new_dt,
+            Err(_) if granularity != "week" => FilterInstant::EndOfTime,
+            Err(_) => return None,
+        };
 
         Some((dt, new_dt))
     }
@@ -6363,27 +6351,84 @@ fn filter_simplify_tail(node_type: impl Display) -> CubeRewrite {
     )
 }
 
-fn format_iso_timestamp(dt: NaiveDateTime) -> String {
-    dt.format_with_items(
-        [
-            Item::Numeric(Year, Zero),
-            Item::Literal("-"),
-            Item::Numeric(Month, Zero),
-            Item::Literal("-"),
-            Item::Numeric(Day, Zero),
-            Item::Literal("T"),
-            Item::Numeric(Hour, Zero),
-            Item::Literal(":"),
-            Item::Numeric(Minute, Zero),
-            Item::Literal(":"),
-            Item::Numeric(Second, Zero),
-            Item::Fixed(Fixed::Nanosecond3),
-            // TODO remove when there're no more non rewrite tests
-            Item::Literal("Z"),
-        ]
-        .iter(),
-    )
-    .to_string()
+fn format_iso_timestamp(dt: DateTime) -> String {
+    // TODO remove `Z` when there're no more non rewrite tests
+    dt.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+/// The instant of a date filter bound: a UTC date and time, or the first instant past the last
+/// one a `DateTime` holds, `10000-01-01T00:00:00`. The day, month, quarter and year holding
+/// `9999-12-31` all end there, and so does a bound moved a millisecond past
+/// `9999-12-31T23:59:59.999`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum FilterInstant {
+    At(DateTime),
+    EndOfTime,
+}
+
+impl FilterInstant {
+    /// `10000-01-01`.
+    const END_OF_TIME_UNIX_DAYS: i64 = 2_932_897;
+    /// A year past 9999 takes a sign in ISO 8601.
+    const END_OF_TIME_ISO: &'static str = "+10000-01-01T00:00:00.000Z";
+
+    /// Reads a filter value, in any form [`parse_date_str`] takes or as `Display` writes it.
+    fn parse(value: &str) -> Option<Self> {
+        if value == Self::END_OF_TIME_ISO {
+            return Some(Self::EndOfTime);
+        }
+        parse_date_str(value).ok().map(Self::At)
+    }
+
+    /// The instant `value` units after the Unix epoch, with `units_per_day` of them in a day and
+    /// `to_datetime` reading them. `None` when it is neither a datetime nor the end of time.
+    fn from_unix(
+        value: i64,
+        units_per_day: i64,
+        to_datetime: impl Fn(i64) -> Option<DateTime>,
+    ) -> Option<Self> {
+        if value == Self::END_OF_TIME_UNIX_DAYS * units_per_day {
+            return Some(Self::EndOfTime);
+        }
+        to_datetime(value).map(Self::At)
+    }
+
+    fn add_millisecond(self) -> Self {
+        match self {
+            Self::At(datetime) => datetime
+                .checked_add(SignedDuration::from_millis(1))
+                .map_or(Self::EndOfTime, Self::At),
+            Self::EndOfTime => Self::EndOfTime,
+        }
+    }
+
+    /// `None` when it is before the first datetime.
+    fn sub_millisecond(self) -> Option<DateTime> {
+        match self {
+            Self::At(datetime) => datetime.checked_sub(SignedDuration::from_millis(1)).ok(),
+            Self::EndOfTime => Some(DateTime::constant(9999, 12, 31, 23, 59, 59, 999_000_000)),
+        }
+    }
+
+    /// See [`FilterRules::naive_datetime_to_timestamp_literal`].
+    fn to_timestamp_literal(self) -> ScalarValue {
+        match self {
+            Self::At(datetime) => FilterRules::naive_datetime_to_timestamp_literal(datetime),
+            Self::EndOfTime => ScalarValue::TimestampMillisecond(
+                Some(Self::END_OF_TIME_UNIX_DAYS * 86_400_000),
+                None,
+            ),
+        }
+    }
+}
+
+impl Display for FilterInstant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::At(datetime) => f.write_str(&format_iso_timestamp(*datetime)),
+            Self::EndOfTime => f.write_str(Self::END_OF_TIME_ISO),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -6425,11 +6470,93 @@ impl Decimal {
 #[cfg(test)]
 mod tests {
     use datafusion::scalar::ScalarValue;
+    use jiff::civil::DateTime;
 
-    use super::FilterRules;
+    use super::{FilterInstant, FilterRules};
 
-    /// A NULL temporal literal has no datetime. `value_as_datetime` ignores validity, so without
-    /// a guard it would read as 1970-01-01 and push down as a real bound.
+    /// The units ending with 9999-12-31 end past the last `DateTime`, and are still ranges.
+    #[test]
+    fn test_range_by_granularity_at_end_of_time() {
+        let last_millisecond = DateTime::constant(9999, 12, 31, 23, 59, 59, 999_000_000);
+        for (granularity, start) in [
+            ("year", DateTime::constant(9999, 1, 1, 0, 0, 0, 0)),
+            ("quarter", DateTime::constant(9999, 10, 1, 0, 0, 0, 0)),
+            ("month", DateTime::constant(9999, 12, 1, 0, 0, 0, 0)),
+            ("day", DateTime::constant(9999, 12, 31, 0, 0, 0, 0)),
+            ("hour", DateTime::constant(9999, 12, 31, 23, 0, 0, 0)),
+            ("minute", DateTime::constant(9999, 12, 31, 23, 59, 0, 0)),
+            ("second", DateTime::constant(9999, 12, 31, 23, 59, 59, 0)),
+        ] {
+            let range = FilterRules::naive_datetime_to_range_by_granularity(
+                start,
+                &granularity.to_string(),
+            );
+            assert_eq!(
+                range,
+                Some((start, FilterInstant::EndOfTime)),
+                "{granularity}"
+            );
+        }
+        assert_eq!(
+            FilterInstant::EndOfTime.sub_millisecond(),
+            Some(last_millisecond)
+        );
+        assert_eq!(
+            FilterInstant::At(last_millisecond).add_millisecond(),
+            FilterInstant::EndOfTime
+        );
+
+        // The week of 9999-12-27 ends on 10000-01-03, which nothing here can hold.
+        assert_eq!(
+            FilterRules::naive_datetime_to_range_by_granularity(
+                DateTime::constant(9999, 12, 27, 0, 0, 0, 0),
+                &"week".to_string()
+            ),
+            None
+        );
+    }
+
+    /// The end of time is one exact instant, in every unit a literal comes in and as text.
+    #[test]
+    fn test_filter_instant_end_of_time_round_trip() {
+        let literal = FilterInstant::EndOfTime.to_timestamp_literal();
+        assert_eq!(
+            literal,
+            ScalarValue::TimestampMillisecond(Some(253_402_300_800_000), None)
+        );
+        for literal in [
+            literal,
+            ScalarValue::TimestampSecond(Some(253_402_300_800), None),
+            ScalarValue::TimestampMicrosecond(Some(253_402_300_800_000_000), None),
+            ScalarValue::Date32(Some(2_932_897)),
+        ] {
+            assert_eq!(
+                FilterRules::scalar_to_filter_instant(&literal),
+                Ok(Some(FilterInstant::EndOfTime)),
+                "{literal:?}"
+            );
+            assert_eq!(FilterRules::scalar_to_native_datetime(&literal), Ok(None));
+        }
+        // A millisecond later is no instant at all.
+        assert_eq!(
+            FilterRules::scalar_to_filter_instant(&ScalarValue::TimestampMillisecond(
+                Some(253_402_300_800_001),
+                None
+            )),
+            Ok(None)
+        );
+
+        let text = FilterInstant::EndOfTime.to_string();
+        assert_eq!(text, "+10000-01-01T00:00:00.000Z");
+        assert_eq!(FilterInstant::parse(&text), Some(FilterInstant::EndOfTime));
+        assert_eq!(
+            FilterInstant::parse("9999-12-31T00:00:00.000Z").map(|instant| instant.to_string()),
+            Some("9999-12-31T00:00:00.000Z".to_string())
+        );
+    }
+
+    /// A NULL temporal literal has no datetime: it must not read as 1970-01-01 and push down as
+    /// a real bound.
     #[test]
     fn test_scalar_to_native_datetime_null() {
         let timestamps = [

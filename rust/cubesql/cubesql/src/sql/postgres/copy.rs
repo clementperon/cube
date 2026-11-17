@@ -6,8 +6,10 @@
 //! The parsing rules follow `CopyReadLineText`, `CopyReadAttributesText` and
 //! `CopyReadAttributesCSV` of PostgreSQL, down to the error messages and codes.
 
-use crate::compile::copy::{CopyFormat, CopyOptions};
-use chrono::{Datelike, NaiveDate, NaiveDateTime};
+use crate::{
+    compile::copy::{CopyFormat, CopyOptions},
+    utils::datetime::{unix_days, unix_nanos},
+};
 use datafusion::arrow::{
     array::{
         ArrayRef, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder, Float64Builder,
@@ -16,13 +18,12 @@ use datafusion::arrow::{
     datatypes::{DataType, SchemaRef, TimeUnit},
     record_batch::RecordBatch,
 };
+use jiff::civil::{Date, DateTime, Time};
 use pg_srv::{
     protocol::{ErrorCode, ErrorResponse},
     ProtocolError,
 };
 use std::{convert::TryFrom, sync::Arc};
-
-const UNIX_EPOCH_DAY: i64 = 719_163;
 
 /// Field metadata holding the declared width of a character column.
 pub const MAX_LENGTH_METADATA: &str = "max_length";
@@ -1070,9 +1071,9 @@ fn parse_bool(value: &str) -> Option<bool> {
 }
 
 fn parse_date(value: &str) -> Option<i32> {
-    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()?;
+    let date = Date::strptime("%Y-%m-%d", value).ok()?;
 
-    Some((date.num_days_from_ce() as i64 - UNIX_EPOCH_DAY) as i32)
+    Some(unix_days(date))
 }
 
 fn parse_timestamp(value: &str) -> Option<i64> {
@@ -1080,15 +1081,14 @@ fn parse_timestamp(value: &str) -> Option<i64> {
     // of the value, if it carries one, is ignored: PostgreSQL does the same
     let value = strip_timezone_offset(value);
 
-    NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
-        .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f"))
+    let timestamp = DateTime::strptime("%Y-%m-%d %H:%M:%S%.f", value)
+        .or_else(|_| DateTime::strptime("%Y-%m-%dT%H:%M:%S%.f", value))
         .or_else(|_| {
-            NaiveDate::parse_from_str(value, "%Y-%m-%d")
-                .map(|date| date.and_hms_opt(0, 0, 0).expect("midnight is a valid time"))
+            Date::strptime("%Y-%m-%d", value).map(|date| date.to_datetime(Time::midnight()))
         })
-        .ok()?
-        .and_utc()
-        .timestamp_nanos_opt()
+        .ok()?;
+
+    unix_nanos(timestamp)
 }
 
 /// Cut off the time zone a timestamp may end with, such as `+03`, `-05:30` or `Z`.
