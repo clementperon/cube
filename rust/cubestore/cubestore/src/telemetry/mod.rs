@@ -1,13 +1,14 @@
 pub mod tracing;
+use crate::util::time::to_rfc3339_millis;
 use crate::CubeError;
 use async_trait::async_trait;
-use chrono::{SecondsFormat, Utc};
 use core::mem;
 use core::time::Duration;
 use datafusion::cube_ext;
 use deflate::deflate_bytes_zlib;
 use futures::{Sink, StreamExt};
 use futures_timer::Delay;
+use jiff::Timestamp;
 use log::{Level, Log, Metadata, Record};
 use nanoid::nanoid;
 use reqwest::header::HeaderMap;
@@ -71,7 +72,7 @@ impl TelemetryTransport for HttpTelemetryTransport {
     async fn send_events(&self, mut to_send: Vec<Map<String, Value>>) -> Result<(), CubeError> {
         let max_retries = 10usize;
         for retry in 0..max_retries {
-            let sent_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+            let sent_at = to_rfc3339_millis(Timestamp::now());
             for event in to_send.iter_mut() {
                 event.insert("sentAt".to_string(), Value::String(sent_at.to_string()));
             }
@@ -161,7 +162,7 @@ impl TelemetryTransport for WsTelemetryTransport {
                 log::error!("Error during agent web socket connect: {}", e);
                 break;
             }
-            let sent_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+            let sent_at = to_rfc3339_millis(Timestamp::now());
             for event in to_send.iter_mut() {
                 event.insert("sentAt".to_string(), Value::String(sent_at.to_string()));
             }
@@ -301,7 +302,7 @@ impl EventSender {
         if is_agent_event {
             properties.insert(
                 "timestamp".to_string(),
-                Value::String(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)),
+                Value::String(to_rfc3339_millis(Timestamp::now())),
             );
         } else {
             properties.insert(
@@ -310,7 +311,7 @@ impl EventSender {
             );
             properties.insert(
                 "clientTimestamp".to_string(),
-                Value::String(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)),
+                Value::String(to_rfc3339_millis(Timestamp::now())),
             );
         }
         self.events.lock().await.push(properties);

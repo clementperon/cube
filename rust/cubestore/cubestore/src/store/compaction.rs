@@ -21,7 +21,6 @@ use crate::table::redistribute::redistribute;
 use crate::table::{Row, TableValue};
 use crate::CubeError;
 use async_trait::async_trait;
-use chrono::Utc;
 use datafusion::arrow::array::UInt64Array;
 use datafusion::arrow::compute::{concat_batches, CastOptions, SortOptions};
 use datafusion::arrow::datatypes::{DataType, Schema};
@@ -51,6 +50,7 @@ use datafusion_datasource::source::DataSourceExec;
 use futures::StreamExt;
 use futures_util::future::join_all;
 use itertools::{EitherOrBoth, Itertools};
+use jiff::Timestamp;
 use num::integer::div_ceil;
 use std::cmp::Ordering;
 use std::fs::File;
@@ -117,7 +117,7 @@ impl CompactionServiceImpl {
         chunks.len() > compaction_in_memory_chunks_count_threshold
             || oldest_insert_at
                 .map(|min| {
-                    Utc::now().signed_duration_since(min).num_seconds()
+                    Timestamp::now().duration_since(min).as_secs()
                         > self
                             .config
                             .compaction_in_memory_chunks_max_lifetime_threshold()
@@ -177,7 +177,7 @@ impl CompactionServiceImpl {
                     && c.get_row()
                         .oldest_insert_at()
                         .map(|m| {
-                            Utc::now().signed_duration_since(m).num_seconds()
+                            Timestamp::now().duration_since(m).as_secs()
                                 <= self
                                     .config
                                     .compaction_in_memory_chunks_max_lifetime_threshold()

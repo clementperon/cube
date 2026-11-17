@@ -8,11 +8,11 @@ use crate::metastore::{
 };
 use crate::CubeError;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use chrono::{DateTime, Utc};
 use cuberockstore::rocksdb::{
     DBIterator, Direction, IteratorMode, ReadOptions, Snapshot, WriteBatch, DB,
 };
 use itertools::Itertools;
+use jiff::Timestamp;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -145,7 +145,7 @@ pub trait BaseRocksSecondaryIndex<T>: Debug {
 
     fn store_ttl_extended_info(&self) -> bool;
 
-    fn get_expire(&self, _row: &T) -> Option<DateTime<Utc>>;
+    fn get_expire(&self, _row: &T) -> Option<Timestamp>;
 
     fn version(&self) -> u32;
 
@@ -186,7 +186,7 @@ pub trait RocksSecondaryIndex<T, K: Hash>: BaseRocksSecondaryIndex<T> {
                     RocksSecondaryIndexValueTTLExtended {
                         lfu: LFU_INIT_VAL,
                         // Specify the current time as protection from LRU eviction
-                        lru: Some(Utc::now()),
+                        lru: Some(Timestamp::now()),
                         raw_size: self.raw_value_size(row),
                     },
                 )
@@ -230,7 +230,7 @@ pub trait RocksSecondaryIndex<T, K: Hash>: BaseRocksSecondaryIndex<T> {
         false
     }
 
-    fn get_expire(&self, _row: &T) -> Option<DateTime<Utc>> {
+    fn get_expire(&self, _row: &T) -> Option<Timestamp> {
         None
     }
 
@@ -267,7 +267,7 @@ where
         RocksSecondaryIndex::store_ttl_extended_info(self)
     }
 
-    fn get_expire(&self, row: &T) -> Option<DateTime<Utc>> {
+    fn get_expire(&self, row: &T) -> Option<Timestamp> {
         RocksSecondaryIndex::get_expire(self, row)
     }
 
@@ -381,7 +381,7 @@ where
 pub struct SecondaryIndexValueScanIterItem {
     pub row_id: u64,
     pub key_hash: SecondaryKeyHash,
-    pub ttl: Option<DateTime<Utc>>,
+    pub ttl: Option<Timestamp>,
     pub extended: Option<RocksSecondaryIndexValueTTLExtended>,
 }
 
@@ -1223,7 +1223,7 @@ pub trait RocksTable: BaseRocksTable + Debug + Send + Sync {
         let mut avg_row_size: u64 = 0;
         let mut max_row_size: u64 = u64::MIN;
 
-        let now = Utc::now();
+        let now = Timestamp::now();
 
         for item in self.scan_index_values(secondary_index)? {
             let item = item?;

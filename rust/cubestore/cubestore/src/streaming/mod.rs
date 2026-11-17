@@ -21,7 +21,6 @@ use crate::util::decimal::Decimal;
 use crate::{app_metrics, CubeError};
 use async_trait::async_trait;
 use buffered_stream::BufferedStream;
-use chrono::Utc;
 use datafusion::arrow::array::ArrayBuilder;
 use datafusion::arrow::array::ArrayRef;
 use futures::future::join_all;
@@ -29,6 +28,7 @@ use futures::stream::StreamExt;
 use futures::Stream;
 use futures_util::stream;
 use itertools::Itertools;
+use jiff::Timestamp;
 use json::JsonValue;
 use log::debug;
 use reqwest::{Response, Url};
@@ -176,7 +176,7 @@ impl StreamingServiceImpl {
 
     async fn try_seal_table(&self, table: &IdRow<Table>) -> Result<bool, CubeError> {
         if let Some(seal_at) = table.get_row().seal_at() {
-            if seal_at < &Utc::now() {
+            if seal_at < &Timestamp::now() {
                 self.meta_store.seal_table(table.get_id()).await?;
                 Ok(true)
             } else {
@@ -948,8 +948,8 @@ mod tests {
     use crate::sql::MySqlDialectWithBackTicks;
     use crate::streaming::kafka::KafkaMessage;
     use crate::streaming::{KSqlQuery, KSqlQuerySchema, KsqlClient, KsqlResponse};
+    use crate::util::time::to_rfc3339_millis;
     use crate::TableId;
-    use chrono::{SecondsFormat, TimeZone, Utc};
     use sqlparser::ast::{BinaryOperator, Expr, SetExpr, Statement, Value};
     use sqlparser::parser::Parser;
     use sqlparser::tokenizer::Tokenizer;
@@ -1111,10 +1111,7 @@ mod tests {
                         continue;
                     }
 
-                    let ts_string = Utc
-                        .timestamp_opt(i, 0)
-                        .unwrap()
-                        .to_rfc3339_opts(SecondsFormat::Millis, true);
+                    let ts_string = to_rfc3339_millis(Timestamp::from_second(i).unwrap());
                     messages.push(KafkaMessage::MockMessage {
                         // Keys in kafka can have suffixes which contain arbitrary metadata like window size
                         key: Some(format!(

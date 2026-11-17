@@ -2,9 +2,8 @@ use crate::metastore::{
     BaseRocksTable, IndexId, RocksEntity, RocksSecondaryIndex, RocksTable, TableId, TableInfo,
 };
 use crate::{base_rocks_secondary_index, rocks_table_new, CubeError};
-use chrono::serde::ts_seconds_option;
-use chrono::{DateTime, Duration, Utc};
 use cuberockstore::rocksdb::WriteBatch;
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -12,8 +11,8 @@ pub struct CacheItem {
     pub(crate) prefix: Option<String>,
     pub(crate) key: String,
     pub(crate) value: String,
-    #[serde(with = "ts_seconds_option")]
-    pub(crate) expire: Option<DateTime<Utc>>,
+    #[serde(with = "jiff::fmt::serde::timestamp::second::optional")]
+    pub(crate) expire: Option<Timestamp>,
 }
 
 // Every RowKey uses 15 bytes
@@ -54,7 +53,7 @@ impl CacheItem {
             prefix,
             key,
             value,
-            expire: ttl.map(|ttl| Utc::now() + Duration::seconds(ttl as i64)),
+            expire: ttl.map(|ttl| Timestamp::now() + SignedDuration::from_secs(ttl as i64)),
         }
     }
 
@@ -74,7 +73,7 @@ impl CacheItem {
         &self.key
     }
 
-    pub fn get_expire(&self) -> &Option<DateTime<Utc>> {
+    pub fn get_expire(&self) -> &Option<Timestamp> {
         &self.expire
     }
 
@@ -180,7 +179,7 @@ impl RocksSecondaryIndex<CacheItem, CacheItemIndexKey> for CacheItemRocksIndex {
         }
     }
 
-    fn get_expire(&self, row: &CacheItem) -> Option<DateTime<Utc>> {
+    fn get_expire(&self, row: &CacheItem) -> Option<Timestamp> {
         row.get_expire().clone()
     }
 

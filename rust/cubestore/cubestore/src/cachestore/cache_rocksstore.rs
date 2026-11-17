@@ -30,11 +30,11 @@ use crate::cachestore::compaction::CompactionPreloadedState;
 use crate::cachestore::listener::RocksCacheStoreListener;
 use crate::cachestore::queue_item_payload::QueueItemPayloadRocksTable;
 use crate::table::{Row, TableValue};
-use chrono::{DateTime, Utc};
 use cuberockstore::rocksdb;
 use datafusion::cube_ext;
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
+use jiff::Timestamp;
 use log::{error, trace, warn};
 use serde_derive::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -661,7 +661,7 @@ impl RocksCacheStore {
     }
 
     fn filter_to_cancel(
-        now: DateTime<Utc>,
+        now: Timestamp,
         items: Vec<IdRow<QueueItem>>,
         orphaned_timeout: Option<u32>,
         heartbeat_timeout: Option<u32>,
@@ -676,7 +676,7 @@ impl RocksCacheStore {
                         }
 
                         let elapsed = now - item.get_row().get_created().clone();
-                        if elapsed.num_milliseconds() > orphaned_timeout as i64 {
+                        if elapsed.as_millis() > orphaned_timeout as i128 {
                             true
                         } else {
                             false
@@ -693,7 +693,7 @@ impl RocksCacheStore {
                         } else {
                             now - item.get_row().get_created().clone()
                         };
-                        if elapsed.num_milliseconds() > heartbeat_timeout as i64 {
+                        if elapsed.as_millis() > heartbeat_timeout as i128 {
                             return true;
                         }
                     }
@@ -2131,6 +2131,7 @@ mod tests {
         RocksSecondaryIndexValueTTLExtended, RocksSecondaryIndexValueVersionEncoder,
     };
     use crate::CubeError;
+    use jiff::SignedDuration;
 
     #[tokio::test]
     async fn test_cachestore_migration() -> Result<(), CubeError> {
@@ -2342,7 +2343,7 @@ mod tests {
             .cache_eviction_manager
             .set_ttl_buffer_last_access(
                 row_id,
-                (Utc::now() + chrono::Duration::hours(3)).encode_value_as_u32()?,
+                (Timestamp::now() + SignedDuration::from_hours(3)).encode_value_as_u32()?,
             )
             .await;
 
@@ -2911,7 +2912,7 @@ mod tests {
 
     #[test]
     fn test_filter_to_cancel() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let item_pending_custom_orphaned = IdRow::new(
             1,
             QueueItem::new(
@@ -2999,7 +3000,7 @@ mod tests {
             0
         );
 
-        let now = now + chrono::Duration::seconds(2);
+        let now = now + SignedDuration::from_secs(2);
 
         assert_eq!(
             RocksCacheStore::filter_to_cancel(
@@ -3679,7 +3680,7 @@ mod tests {
         // Less than a full timeout left: written, and at least a full timeout is left again
         let mut due = item(590);
         assert!(due.touch_orphaned(600).is_some());
-        assert!(due.get_orphaned().unwrap() >= chrono::Utc::now() + chrono::Duration::seconds(600));
+        assert!(due.get_orphaned().unwrap() >= Timestamp::now() + SignedDuration::from_secs(600));
         // so the poll right after it is skipped
         assert_eq!(due.touch_orphaned(600), None);
     }
@@ -3718,8 +3719,8 @@ mod tests {
             .get_row()
             .get_orphaned()
             .expect("touched item has a deadline");
-        assert!(deadline > chrono::Utc::now() + chrono::Duration::seconds(500));
-        assert!(*after.get_row().get_expire() >= deadline + chrono::Duration::hours(2));
+        assert!(deadline > Timestamp::now() + SignedDuration::from_secs(500));
+        assert!(*after.get_row().get_expire() >= deadline + SignedDuration::from_hours(2));
 
         let to_cancel = cachestore
             .queue_to_cancel("prefix".to_string(), Some(120_000), None)
@@ -3844,7 +3845,7 @@ mod tests {
             .get_row()
             .get_orphaned()
             .expect("touched item has a deadline");
-        assert!(deadline > chrono::Utc::now() + chrono::Duration::seconds(500));
+        assert!(deadline > Timestamp::now() + SignedDuration::from_secs(500));
 
         RocksCacheStore::cleanup_test_cachestore("test_queue_add_and_retrieve_touches_then_claims");
 

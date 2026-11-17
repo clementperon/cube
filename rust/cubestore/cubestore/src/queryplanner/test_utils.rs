@@ -17,7 +17,7 @@ use crate::metastore::{
 use crate::table::Row;
 use crate::CubeError;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -95,8 +95,8 @@ impl MetaStore for MetaStoreMock {
         _import_format: Option<ImportFormat>,
         _indexes: Vec<IndexDef>,
         _is_ready: bool,
-        _build_range_end: Option<DateTime<Utc>>,
-        _seal_at: Option<DateTime<Utc>>,
+        _build_range_end: Option<Timestamp>,
+        _seal_at: Option<Timestamp>,
         _select_statement: Option<String>,
         _source_columns: Option<Vec<Column>>,
         _stream_offset: Option<StreamOffset>,
@@ -523,7 +523,7 @@ impl MetaStore for MetaStoreMock {
     async fn chunk_update_last_inserted(
         &self,
         _chunk_ids: Vec<u64>,
-        _last_inserted_at: Option<DateTime<Utc>>,
+        _last_inserted_at: Option<Timestamp>,
     ) -> Result<(), CubeError> {
         panic!("MetaStore mock!")
     }

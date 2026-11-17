@@ -13,6 +13,7 @@ pub mod metrics;
 #[cfg(not(target_os = "windows"))]
 pub mod respawn;
 pub mod strings;
+pub mod time;
 pub mod time_span;
 
 pub use logger::string_to_level;

@@ -4,7 +4,7 @@ use crate::rocks_table_impl;
 use crate::table::Row;
 use crate::{base_rocks_secondary_index, CubeError};
 use byteorder::{BigEndian, WriteBytesExt};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 
@@ -26,8 +26,8 @@ impl Chunk {
             active: false,
             last_used: None,
             in_memory,
-            created_at: Some(Utc::now()),
-            oldest_insert_at: Some(Utc::now()),
+            created_at: Some(Timestamp::now()),
+            oldest_insert_at: Some(Timestamp::now()),
             deactivated_at: None,
             suffix: Some(
                 String::from_utf8(thread_rng().sample_iter(&Alphanumeric).take(8).collect())
@@ -66,7 +66,7 @@ impl Chunk {
         to_update
     }
 
-    pub fn set_oldest_insert_at(&self, oldest_insert_at: Option<DateTime<Utc>>) -> Chunk {
+    pub fn set_oldest_insert_at(&self, oldest_insert_at: Option<Timestamp>) -> Chunk {
         let mut to_update = self.clone();
         to_update.oldest_insert_at = oldest_insert_at;
         to_update
@@ -90,7 +90,7 @@ impl Chunk {
     pub fn deactivate(&self) -> Chunk {
         let mut to_update = self.clone();
         to_update.active = false;
-        to_update.deactivated_at = Some(Utc::now());
+        to_update.deactivated_at = Some(Timestamp::now());
         to_update.replay_handle_id = None;
         to_update
     }
@@ -125,15 +125,15 @@ impl Chunk {
         self.in_memory
     }
 
-    pub fn created_at(&self) -> &Option<DateTime<Utc>> {
+    pub fn created_at(&self) -> &Option<Timestamp> {
         &self.created_at
     }
 
-    pub fn oldest_insert_at(&self) -> &Option<DateTime<Utc>> {
+    pub fn oldest_insert_at(&self) -> &Option<Timestamp> {
         &self.oldest_insert_at
     }
 
-    pub fn deactivated_at(&self) -> &Option<DateTime<Utc>> {
+    pub fn deactivated_at(&self) -> &Option<Timestamp> {
         &self.deactivated_at
     }
 

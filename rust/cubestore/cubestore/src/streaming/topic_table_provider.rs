@@ -2,8 +2,6 @@ use crate::metastore::Column;
 use crate::queryplanner::udfs::{registerable_aggregate_udfs_iter, registerable_scalar_udfs_iter};
 use crate::CubeError;
 use async_trait::async_trait;
-use chrono::{TimeZone, Utc};
-use chrono_tz::Tz;
 use datafusion::arrow::array::{
     Array, StringArray, StringBuilder, TimestampMicrosecondArray, TimestampMicrosecondBuilder,
 };
@@ -23,6 +21,9 @@ use datafusion::physical_plan::ColumnarValue;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::planner::ContextProvider;
+use jiff::fmt::strtime::{self, BrokenDownTime};
+use jiff::tz::{AmbiguousOffset, Offset, TimeZone};
+use jiff::Timestamp;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -173,9 +174,88 @@ fn sql_format_to_strformat(sql_format: &str) -> String {
         .replace("'T'", "T")
 }
 
+/// Parses `input` with a strftime `format` as a wall clock time in `tz` and returns microseconds
+/// since the Unix epoch.
+///
+/// The format has to yield a date, an hour and a minute. A wall clock time that `tz` skips (DST
+/// gap) is an error, and so is one that occurs twice (DST fold) unless the input carries an
+/// offset telling the two apart. A parsed offset has to agree with `tz`.
+fn parse_timestamp_micros(input: &str, format: &str, tz: &TimeZone) -> Result<i64, String> {
+    let parsed = BrokenDownTime::parse(format, input).map_err(|e| e.to_string())?;
+    if parsed.hour().is_none() || parsed.minute().is_none() {
+        return Err("input is not enough for unique date and time".to_string());
+    }
+    let wall_clock = parsed.to_datetime().map_err(|e| e.to_string())?;
+    let parsed_offset = parsed.offset();
+    let matches_parsed = |offset: Offset| parsed_offset.map_or(true, |parsed| parsed == offset);
+
+    let ambiguous = tz.to_ambiguous_timestamp(wall_clock);
+    let timestamp = match ambiguous.offset() {
+        AmbiguousOffset::Unambiguous { offset } if matches_parsed(offset) => {
+            ambiguous.unambiguous()
+        }
+        AmbiguousOffset::Fold { before, after } => {
+            match (matches_parsed(before), matches_parsed(after)) {
+                (true, false) => ambiguous.earlier(),
+                (false, true) => ambiguous.later(),
+                (true, true) => {
+                    return Err("input is not enough for unique date and time".to_string())
+                }
+                (false, false) => {
+                    return Err("no possible date and time matching input".to_string())
+                }
+            }
+        }
+        AmbiguousOffset::Unambiguous { .. } | AmbiguousOffset::Gap { .. } => {
+            return Err("no possible date and time matching input".to_string())
+        }
+    }
+    .map_err(|e| e.to_string())?;
+
+    // Floor rather than truncate, so instants before 1970 land on the earlier microsecond.
+    i64::try_from(timestamp.as_nanosecond().div_euclid(1_000)).map_err(|e| e.to_string())
+}
+
+/// The UTC wall clock of a `TimestampMicrosecond` value.
+fn micros_to_wall_clock(micros: i64) -> Result<jiff::civil::DateTime, jiff::Error> {
+    Ok(Offset::UTC.to_datetime(Timestamp::from_microsecond(micros)?))
+}
+
+/// Reads `micros` as a wall clock time in `from_tz` and returns the wall clock time `to_tz` shows
+/// at the same instant. Of a wall clock time that occurs twice in `from_tz`, the earlier one wins.
+fn convert_tz_micros(
+    micros: i64,
+    from_tz: &TimeZone,
+    to_tz: &TimeZone,
+) -> Result<i64, DataFusionError> {
+    let error =
+        || DataFusionError::Execution(format!("Can't convert timezone for timestamp {}", micros));
+    let wall_clock = micros_to_wall_clock(micros).map_err(|_| error())?;
+    let ambiguous = from_tz.to_ambiguous_timestamp(wall_clock);
+    if matches!(ambiguous.offset(), AmbiguousOffset::Gap { .. }) {
+        return Err(error());
+    }
+    let instant = ambiguous.earlier().map_err(|_| error())?;
+    Offset::UTC
+        .to_timestamp(to_tz.to_datetime(instant))
+        .map(|converted| converted.as_microsecond())
+        .map_err(|_| error())
+}
+
+fn format_timestamp_micros(micros: i64, format: &str) -> Result<String, DataFusionError> {
+    micros_to_wall_clock(micros)
+        .and_then(|wall_clock| strtime::format(format, wall_clock))
+        .map_err(|e| {
+            DataFusionError::Execution(format!(
+                "Error while formatting timestamp {}: {}",
+                micros, e
+            ))
+        })
+}
+
 fn parse_timestamp_array(
     input: &StringArray,
-    tz: &Tz,
+    tz: &TimeZone,
     format: &str,
 ) -> Result<TimestampMicrosecondArray, DataFusionError> {
     let mut result = TimestampMicrosecondBuilder::new();
@@ -183,11 +263,8 @@ fn parse_timestamp_array(
         if input.is_null(i) {
             result.append_null();
         } else {
-            #[allow(deprecated)]
-            let parse_result = tz.datetime_from_str(input.value(i), &format);
-
-            let ts = match parse_result {
-                Ok(ts) => ts,
+            let micros = match parse_timestamp_micros(input.value(i), format, tz) {
+                Ok(micros) => micros,
                 Err(e) => {
                     return Err(DataFusionError::Execution(format!(
                         "Error while parsing timestamp `{}`: {}",
@@ -196,7 +273,7 @@ fn parse_timestamp_array(
                     )));
                 }
             };
-            result.append_value(ts.timestamp_micros());
+            result.append_value(micros);
         }
     }
     Ok(result.finish())
@@ -204,8 +281,8 @@ fn parse_timestamp_array(
 
 fn convert_tz_array(
     input: &TimestampMicrosecondArray,
-    from_tz: &Tz,
-    to_tz: &Tz,
+    from_tz: &TimeZone,
+    to_tz: &TimeZone,
 ) -> Result<TimestampMicrosecondArray, DataFusionError> {
     let mut result = TimestampMicrosecondBuilder::new();
     if from_tz == to_tz {
@@ -221,20 +298,7 @@ fn convert_tz_array(
             if input.is_null(i) {
                 result.append_null();
             } else {
-                let time = Utc
-                    .timestamp_nanos(input.value(i) as i64 * 1000)
-                    .naive_local();
-                let from = match from_tz.from_local_datetime(&time).earliest() {
-                    Some(t) => t,
-                    None => {
-                        return Err(DataFusionError::Execution(format!(
-                            "Can't convert timezone for timestamp {}",
-                            input.value(i)
-                        )));
-                    }
-                };
-                let res = from.with_timezone(to_tz);
-                result.append_value(res.naive_local().and_utc().timestamp_micros());
+                result.append_value(convert_tz_micros(input.value(i), from_tz, to_tz)?);
             }
         }
     }
@@ -249,10 +313,7 @@ fn format_timestamp_array(
         if input.is_null(i) {
             result.append_null();
         } else {
-            let time = Utc
-                .timestamp_nanos(input.value(i) as i64 * 1000)
-                .naive_local();
-            result.append_value(format!("{}", time.format(format)));
+            result.append_value(format_timestamp_micros(input.value(i), format)?);
         }
     }
     Ok(result.finish())
@@ -314,11 +375,13 @@ impl ScalarUDFImpl for ParseTimestampFunc {
                 ));
             }
         };
-        let tz: Tz = if inputs.len() == 3 {
+        let tz: TimeZone = if inputs.len() == 3 {
             match &inputs[2] {
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => s.parse().map_err(|_| {
-                    CubeError::user(format!("Incorrect timezone {} in PARSE_TIMESTAMP", s))
-                })?,
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => {
+                    TimeZone::get(s).map_err(|_| {
+                        CubeError::user(format!("Incorrect timezone {} in PARSE_TIMESTAMP", s))
+                    })?
+                }
                 _ => {
                     return Err(DataFusionError::Execution(
                         "Only scalar arguments are supported as timezone in PARSE_TIMESTAMP"
@@ -327,16 +390,13 @@ impl ScalarUDFImpl for ParseTimestampFunc {
                 }
             }
         } else {
-            Tz::UTC
+            TimeZone::UTC
         };
 
         match &inputs[0] {
             ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => {
-                #[allow(deprecated)]
-                let parse_result = tz.datetime_from_str(s, &format);
-
-                let ts = match parse_result {
-                    Ok(ts) => ts,
+                let micros = match parse_timestamp_micros(s, &format, &tz) {
+                    Ok(micros) => micros,
                     Err(e) => {
                         return Err(DataFusionError::Execution(format!(
                             "Error while parsing timestamp: {}",
@@ -345,7 +405,7 @@ impl ScalarUDFImpl for ParseTimestampFunc {
                     }
                 };
                 Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
-                    Some(ts.timestamp_micros()),
+                    Some(micros),
                     None,
                 )))
             }
@@ -414,10 +474,12 @@ impl ScalarUDFImpl for ConvertTzFunc {
             ));
         }
 
-        let from_tz: Tz = match &inputs[1] {
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => s.parse().map_err(|_| {
-                CubeError::user(format!("Incorrect timezone {} in CONVERT_TZ_KSQL", s))
-            })?,
+        let from_tz: TimeZone = match &inputs[1] {
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => {
+                TimeZone::get(s).map_err(|_| {
+                    CubeError::user(format!("Incorrect timezone {} in CONVERT_TZ_KSQL", s))
+                })?
+            }
             _ => {
                 return Err(DataFusionError::Execution(
                     "Only scalar arguments are supported as from_timezone in CONVERT_TZ_KSQL"
@@ -426,10 +488,12 @@ impl ScalarUDFImpl for ConvertTzFunc {
             }
         };
 
-        let to_tz: Tz = match &inputs[2] {
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => s.parse().map_err(|_| {
-                CubeError::user(format!("Incorrect timezone {} in CONVERT_TZ_KSQL", s))
-            })?,
+        let to_tz: TimeZone = match &inputs[2] {
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => {
+                TimeZone::get(s).map_err(|_| {
+                    CubeError::user(format!("Incorrect timezone {} in CONVERT_TZ_KSQL", s))
+                })?
+            }
             _ => {
                 return Err(DataFusionError::Execution(
                     "Only scalar arguments are supported as to_timezone in CONVERT_TZ_KSQL"
@@ -445,19 +509,8 @@ impl ScalarUDFImpl for ConvertTzFunc {
                         None,
                     )))
                 } else {
-                    let time = Utc.timestamp_nanos(*t * 1000).naive_local();
-                    let from = match from_tz.from_local_datetime(&time).earliest() {
-                        Some(t) => t,
-                        None => {
-                            return Err(DataFusionError::Execution(format!(
-                                "Can't convert timezone for timestamp {}",
-                                t
-                            )));
-                        }
-                    };
-                    let result = from.with_timezone(&to_tz);
                     Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
-                        Some(result.naive_local().and_utc().timestamp_micros()),
+                        Some(convert_tz_micros(*t, &from_tz, &to_tz)?),
                         None,
                     )))
                 }
@@ -540,11 +593,9 @@ impl ScalarUDFImpl for FormatTimestampFunc {
 
         match &inputs[0] {
             ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(Some(t), None)) => {
-                let time = Utc.timestamp_nanos(*t * 1000).naive_local();
-                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(format!(
-                    "{}",
-                    time.format(&format)
-                )))))
+                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+                    format_timestamp_micros(*t, &format)?,
+                ))))
             }
             ColumnarValue::Array(t) if t.as_any().is::<TimestampMicrosecondArray>() => {
                 let t = t
@@ -562,5 +613,134 @@ impl ScalarUDFImpl for FormatTimestampFunc {
                 ));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn micros(rfc3339: &str) -> i64 {
+        rfc3339.parse::<Timestamp>().unwrap().as_microsecond()
+    }
+
+    fn tz(name: &str) -> TimeZone {
+        TimeZone::get(name).unwrap()
+    }
+
+    #[test]
+    fn parse_timestamp_in_time_zone() {
+        let parse = |input: &str, format: &str, zone: &str| {
+            parse_timestamp_micros(input, &sql_format_to_strformat(format), &tz(zone))
+        };
+
+        assert_eq!(
+            parse(
+                "2023-06-05T03:00:00.300Z",
+                "yyyy-MM-dd'T'HH:mm:ss.SSSX",
+                "UTC"
+            ),
+            Ok(micros("2023-06-05T03:00:00.3Z"))
+        );
+        // The fraction is optional.
+        assert_eq!(
+            parse("2023-06-05T03:00:00Z", "yyyy-MM-dd'T'HH:mm:ss.SSSX", "UTC"),
+            Ok(micros("2023-06-05T03:00:00Z"))
+        );
+        assert_eq!(
+            parse(
+                "2023-06-05 06:12:23",
+                "yyyy-MM-dd HH:mm:ss",
+                "Europe/Istanbul"
+            ),
+            Ok(micros("2023-06-05T03:12:23Z"))
+        );
+        assert_eq!(
+            parse("1969-12-31 23:59:59.999", "yyyy-MM-dd HH:mm:ss.SSS", "UTC"),
+            Ok(-1_000)
+        );
+
+        // A date alone is not enough.
+        assert!(parse("2023-06-05", "yyyy-MM-dd", "UTC").is_err());
+        assert!(parse("2023-02-30 00:00:00", "yyyy-MM-dd HH:mm:ss", "UTC").is_err());
+        assert!(parse("2023-06-05 03:00:00 ", "yyyy-MM-dd HH:mm:ss", "UTC").is_err());
+    }
+
+    #[test]
+    fn parse_timestamp_around_dst_transitions() {
+        let new_york = tz("America/New_York");
+        let parse = |input: &str, format: &str| parse_timestamp_micros(input, format, &new_york);
+
+        // 02:30 does not exist on the day clocks spring forward.
+        assert!(parse("2023-03-12 02:30:00", "%Y-%m-%d %H:%M:%S").is_err());
+        // 01:30 occurs twice on the day clocks fall back: ambiguous without an offset.
+        assert!(parse("2023-11-05 01:30:00", "%Y-%m-%d %H:%M:%S").is_err());
+        assert_eq!(
+            parse("2023-11-05 01:30:00 -0400", "%Y-%m-%d %H:%M:%S %z"),
+            Ok(micros("2023-11-05T05:30:00Z"))
+        );
+        assert_eq!(
+            parse("2023-11-05 01:30:00 -0500", "%Y-%m-%d %H:%M:%S %z"),
+            Ok(micros("2023-11-05T06:30:00Z"))
+        );
+        // An offset the time zone does not have at that time.
+        assert!(parse("2023-11-05 01:30:00 -0600", "%Y-%m-%d %H:%M:%S %z").is_err());
+        assert!(parse("2023-06-05 03:00:00 +0300", "%Y-%m-%d %H:%M:%S %z").is_err());
+        assert_eq!(
+            parse("2023-06-05 03:00:00 -0400", "%Y-%m-%d %H:%M:%S %z"),
+            Ok(micros("2023-06-05T07:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn convert_tz_around_dst_transitions() {
+        let convert = |wall_clock: &str, from: &str, to: &str| {
+            convert_tz_micros(micros(wall_clock), &tz(from), &tz(to)).ok()
+        };
+
+        assert_eq!(
+            convert("2023-06-05T03:12:23.3Z", "UTC", "Europe/Istanbul"),
+            Some(micros("2023-06-05T06:12:23.3Z"))
+        );
+        assert_eq!(
+            convert(
+                "2023-06-05T03:12:23Z",
+                "Asia/Krasnoyarsk",
+                "Europe/Istanbul"
+            ),
+            Some(micros("2023-06-04T23:12:23Z"))
+        );
+        // A wall clock time that occurs twice resolves to the earlier instant.
+        assert_eq!(
+            convert("2023-11-05T01:30:00Z", "America/New_York", "UTC"),
+            Some(micros("2023-11-05T05:30:00Z"))
+        );
+        // One that does not exist can not be converted.
+        assert_eq!(
+            convert("2023-03-12T02:30:00Z", "America/New_York", "UTC"),
+            None
+        );
+    }
+
+    #[test]
+    fn format_timestamp() {
+        let format = |timestamp: &str, format: &str| {
+            format_timestamp_micros(micros(timestamp), &sql_format_to_strformat(format)).ok()
+        };
+
+        assert_eq!(
+            format("2023-06-05T03:00:00.3Z", "yyyy-MM-dd'T'HH:mm:ss.SSSX").as_deref(),
+            Some("2023-06-05T03:00:00.300Z")
+        );
+        assert_eq!(
+            format("2023-06-05T03:00:00.123456Z", "yyyy-MM-dd HH:mm:ss.SSS").as_deref(),
+            Some("2023-06-05 03:00:00.123")
+        );
+        assert_eq!(
+            format("1969-12-31T23:59:59.5Z", "yyyyMMddHH").as_deref(),
+            Some("1969123123")
+        );
+        // An invalid format is an error, not a panic.
+        assert_eq!(format("2023-06-05T03:00:00Z", "%!"), None);
     }
 }

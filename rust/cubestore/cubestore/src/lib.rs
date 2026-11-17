@@ -390,8 +390,8 @@ impl From<s3::error::S3Error> for CubeError {
         CubeError::internal(format!("AWS S3 error: {}", v.to_string()))
     }
 }
-impl From<chrono::ParseError> for CubeError {
-    fn from(v: chrono::ParseError) -> Self {
+impl From<jiff::Error> for CubeError {
+    fn from(v: jiff::Error) -> Self {
         CubeError::from_error(v)
     }
 }

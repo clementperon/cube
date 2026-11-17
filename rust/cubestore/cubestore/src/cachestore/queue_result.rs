@@ -4,9 +4,8 @@ use crate::metastore::{
     TableInfo,
 };
 use crate::{base_rocks_secondary_index, rocks_table_new, CubeError};
-use chrono::serde::ts_seconds;
-use chrono::{DateTime, Duration, Utc};
 use cuberockstore::rocksdb::WriteBatch;
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -14,8 +13,8 @@ pub struct QueueResult {
     path: String,
     pub(crate) value: String,
     pub(crate) deleted: bool,
-    #[serde(with = "ts_seconds")]
-    pub(crate) expire: DateTime<Utc>,
+    #[serde(with = "jiff::fmt::serde::timestamp::second::required")]
+    pub(crate) expire: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) external_id: Option<String>,
 }
@@ -32,7 +31,7 @@ impl QueueResult {
             path,
             value,
             deleted: false,
-            expire: Utc::now() + Duration::minutes(5),
+            expire: Timestamp::now() + SignedDuration::from_mins(5),
             external_id,
         }
     }
@@ -45,7 +44,7 @@ impl QueueResult {
         &self.value
     }
 
-    pub fn get_expire(&self) -> &DateTime<Utc> {
+    pub fn get_expire(&self) -> &Timestamp {
         &self.expire
     }
 
@@ -84,7 +83,7 @@ impl<'a> QueueResultRocksTable<'a> {
             QueueKey::ById(id) => self.get_row(id)?,
         };
 
-        Ok(row.filter(|r| r.get_row().get_expire() >= &Utc::now()))
+        Ok(row.filter(|r| r.get_row().get_expire() >= &Timestamp::now()))
     }
 
     pub fn get_row_by_path_and_external_id(
@@ -96,7 +95,7 @@ impl<'a> QueueResultRocksTable<'a> {
         let row = self
             .get_single_opt_row_by_index(&index_key, &QueueResultRocksIndex::ByPathAndExternalId)?;
 
-        Ok(row.filter(|r| r.get_row().get_expire() >= &Utc::now()))
+        Ok(row.filter(|r| r.get_row().get_expire() >= &Timestamp::now()))
     }
 }
 
@@ -175,7 +174,7 @@ impl RocksSecondaryIndex<QueueResult, QueueResultIndexKey> for QueueResultRocksI
         true
     }
 
-    fn get_expire(&self, row: &QueueResult) -> Option<DateTime<Utc>> {
+    fn get_expire(&self, row: &QueueResult) -> Option<Timestamp> {
         Some(row.expire.clone())
     }
 

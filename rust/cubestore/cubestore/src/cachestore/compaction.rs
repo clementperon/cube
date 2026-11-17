@@ -3,12 +3,12 @@ use crate::metastore::{
 };
 use crate::TableId;
 
-use chrono::{DateTime, Utc};
 use cuberockstore::rocksdb::compaction_filter::CompactionFilter;
 use cuberockstore::rocksdb::compaction_filter_factory::{
     CompactionFilterContext, CompactionFilterFactory,
 };
 use cuberockstore::rocksdb::CompactionDecision;
+use jiff::Timestamp;
 use log::{error, trace, warn};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 pub struct MetaStoreCacheCompactionFilter {
     name: CString,
-    current: DateTime<Utc>,
+    current: Timestamp,
     scanned: u64,
     removed: u64,
     orphaned: u64,
@@ -30,7 +30,7 @@ impl MetaStoreCacheCompactionFilter {
     pub fn new(state: CompactionSharedState, context: CompactionFilterContext) -> Self {
         Self {
             name: CString::new("cache-expire-check").unwrap(),
-            current: Utc::now(),
+            current: Timestamp::now(),
             scanned: 0,
             removed: 0,
             orphaned: 0,
@@ -44,12 +44,12 @@ impl MetaStoreCacheCompactionFilter {
 
 impl Drop for MetaStoreCacheCompactionFilter {
     fn drop(&mut self) {
-        let elapsed = Utc::now() - self.current;
+        let elapsed = Timestamp::now() - self.current;
 
         trace!(
             "Compaction finished in {}.{} secs (is_full: {}), scanned: {}, removed: {}, orphaned: {}, no_ttl: {}, not_expired: {})",
-            elapsed.num_seconds(),
-            elapsed.num_milliseconds(),
+            elapsed.as_secs(),
+            elapsed.as_millis(),
             self.context.is_full_compaction,
             self.scanned,
             self.removed,
@@ -103,7 +103,7 @@ impl MetaStoreCacheCompactionFilter {
             return CompactionDecision::Keep;
         }
 
-        match DateTime::from_timestamp(expire.as_i64(), 0) {
+        match Timestamp::from_second(expire.as_i64()).ok() {
             Some(expire) => {
                 if expire <= self.current {
                     self.removed += 1;
@@ -269,8 +269,8 @@ mod tests {
     use crate::config::init_test_logger;
     use crate::metastore::{BaseRocksSecondaryIndex, RocksTable};
     use crate::TableId;
-    use chrono::Duration;
     use cuberockstore::rocksdb::compaction_filter::Decision;
+    use jiff::SignedDuration;
     use serde::Serialize;
 
     fn get_test_filter_context() -> CompactionFilterContext {
@@ -335,7 +335,7 @@ mod tests {
 
         let key = RowKey::Table(TableId::CacheItems, 6);
         let mut row = CacheItem::new("key1".to_string(), None, "value".to_string());
-        row.expire = Some(Utc::now() - Duration::seconds(10));
+        row.expire = Some(Timestamp::now() - SignedDuration::from_secs(10));
 
         let mut ser = flexbuffers::FlexbufferSerializer::new();
         row.serialize(&mut ser).unwrap();
@@ -357,7 +357,7 @@ mod tests {
         );
 
         let mut row = CacheItem::new("key1".to_string(), None, "value".to_string());
-        row.expire = Some(Utc::now() - Duration::seconds(10));
+        row.expire = Some(Timestamp::now() - SignedDuration::from_secs(10));
 
         let index = CacheItemRocksIndex::ByPath;
         let key = RowKey::SecondaryIndex(

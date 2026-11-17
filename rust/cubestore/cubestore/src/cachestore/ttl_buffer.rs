@@ -1,6 +1,6 @@
 use crate::metastore::{PackedDateTime, RocksSecondaryIndexValueVersionEncoder};
-use chrono::Utc;
 use deepsize::DeepSizeOf;
+use jiff::Timestamp;
 use std::hash::BuildHasher;
 
 /// `Option<T>` packed into `T` itself: the last value, `T::max_value()`, stands for `None`
@@ -98,7 +98,7 @@ impl TTLBuffer {
         if let Some(i) = self.find(row_id) {
             let data = &mut self.nodes[i as usize].data;
             data.hits = data.hits.saturating_add(1);
-            data.last_access = Utc::now().encode_value_as_u32().unwrap();
+            data.last_access = Timestamp::now().encode_value_as_u32().unwrap();
 
             return;
         }
@@ -109,7 +109,7 @@ impl TTLBuffer {
             return;
         }
 
-        let now = Utc::now().encode_value_as_u32().unwrap();
+        let now = Timestamp::now().encode_value_as_u32().unwrap();
 
         let node = Node {
             row_id,

@@ -5,8 +5,8 @@ use crate::remotefs::{
 use crate::util::lock::acquire_lock;
 use crate::CubeError;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use datafusion::cube_ext;
+use jiff::Timestamp;
 use log::{debug, info};
 use regex::{NoExpand, Regex};
 use s3::creds::Credentials;
@@ -319,8 +319,7 @@ impl RemoteFs for MINIORemoteFs {
                     .map(|o| -> Result<RemoteFile, CubeError> {
                         Ok(RemoteFile {
                             remote_path: leading_slash.replace(&o.key, NoExpand("")).to_string(),
-                            updated: DateTime::parse_from_rfc3339(&o.last_modified)?
-                                .with_timezone(&Utc),
+                            updated: o.last_modified.parse::<Timestamp>()?,
                             file_size: o.size,
                         })
                     })

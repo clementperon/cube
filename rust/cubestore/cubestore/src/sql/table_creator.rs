@@ -18,8 +18,8 @@ use crate::sql::{normalize_for_column_name, normalize_for_schema_table_or_index_
 use crate::telemetry::incoming_traffic_agent_event;
 use crate::CubeError;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use futures::future::join_all;
+use jiff::Timestamp;
 use log;
 use sqlparser::ast::*;
 use tokio::sync::broadcast;
@@ -90,8 +90,8 @@ impl TableCreator {
         if_not_exists: bool,
         locations: Option<Vec<String>>,
         import_format: Option<ImportFormat>,
-        build_range_end: Option<DateTime<Utc>>,
-        seal_at: Option<DateTime<Utc>>,
+        build_range_end: Option<Timestamp>,
+        seal_at: Option<Timestamp>,
         select_statement: Option<String>,
         source_table: Option<String>,
         stream_offset: Option<String>,
@@ -176,8 +176,8 @@ impl TableCreator {
         if_not_exists: bool,
         locations: Option<Vec<String>>,
         import_format: Option<ImportFormat>,
-        build_range_end: Option<DateTime<Utc>>,
-        seal_at: Option<DateTime<Utc>>,
+        build_range_end: Option<Timestamp>,
+        seal_at: Option<Timestamp>,
         select_statement: Option<String>,
         source_table: Option<String>,
         stream_offset: Option<String>,
@@ -279,8 +279,8 @@ impl TableCreator {
         if_not_exists: bool,
         locations: Option<Vec<String>>,
         import_format: Option<ImportFormat>,
-        build_range_end: Option<DateTime<Utc>>,
-        seal_at: Option<DateTime<Utc>>,
+        build_range_end: Option<Timestamp>,
+        seal_at: Option<Timestamp>,
         select_statement: Option<String>,
         source_table: Option<String>,
         stream_offset: Option<String>,
