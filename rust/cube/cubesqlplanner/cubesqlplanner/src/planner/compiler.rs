@@ -12,8 +12,8 @@ use crate::cube_bridge::security_context::SecurityContext;
 use crate::planner::query_tools::QueryTools;
 use crate::planner::sql_call_builder::SqlCallBuilder;
 use crate::planner::sql_templates::PlanSqlTemplates;
-use chrono_tz::Tz;
 use cubenativeutils::CubeError;
+use jiff::tz::TimeZone;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
@@ -32,7 +32,7 @@ pub struct Compiler {
     cube_evaluator: Rc<dyn CubeEvaluator>,
     base_tools: Rc<dyn BaseTools>,
     security_context: Rc<dyn SecurityContext>,
-    timezone: Tz,
+    timezone: TimeZone,
     member_to_alias: Option<HashMap<String, String>>,
     members: HashMap<SymbolPath, Rc<MemberSymbol>>,
     cube_names: HashMap<Vec<CubeId>, Rc<CubeNameSymbol>>,
@@ -53,7 +53,7 @@ impl Compiler {
         model_cubes: Rc<ModelCubes>,
         base_tools: Rc<dyn BaseTools>,
         security_context: Rc<dyn SecurityContext>,
-        timezone: Tz,
+        timezone: TimeZone,
         member_to_alias: Option<HashMap<String, String>>,
         max_resolution_depth: Option<usize>,
     ) -> Self {
@@ -313,7 +313,7 @@ impl Compiler {
         &self.model_cubes
     }
 
-    pub fn timezone(&self) -> Tz {
+    pub fn timezone(&self) -> TimeZone {
         self.timezone.clone()
     }
 

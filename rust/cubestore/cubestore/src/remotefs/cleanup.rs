@@ -2,9 +2,9 @@ use crate::config::ConfigObj;
 use crate::metastore::MetaStore;
 use crate::remotefs::RemoteFs;
 use crate::{app_metrics, CubeError};
-use chrono::Utc;
 use datafusion::cube_ext;
 use futures::StreamExt;
+use jiff::Timestamp;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -140,11 +140,7 @@ impl RemoteFsCleanup {
                 if files_from_metastore.get(file_name).is_some() {
                     continue;
                 }
-                if Utc::now()
-                    .signed_duration_since(f.updated().clone())
-                    .num_seconds()
-                    < cleanup_files_delay
-                {
+                if Timestamp::now().duration_since(*f.updated()).as_secs() < cleanup_files_delay {
                     continue;
                 }
                 files_to_remove_size += f.file_size;
@@ -499,7 +495,7 @@ mod test {
             Ok((0..SLOW_FS_FILES)
                 .map(|i| RemoteFile {
                     remote_path: format!("{}-orphan.parquet", 900000 + i),
-                    updated: Utc::now(),
+                    updated: Timestamp::now(),
                     file_size: 1,
                 })
                 .collect())

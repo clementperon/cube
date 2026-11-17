@@ -2,19 +2,18 @@ use crate::metastore::{
     BaseRocksTable, IndexId, RocksEntity, RocksSecondaryIndex, RocksTable, TableId, TableInfo,
 };
 use crate::{base_rocks_secondary_index, rocks_table_new, CubeError};
-use chrono::serde::ts_seconds;
-use chrono::{DateTime, Utc};
 use cuberockstore::rocksdb::WriteBatch;
+use jiff::Timestamp;
 use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct QueueItemPayload {
     // Immutable field
     pub(crate) value: String,
-    #[serde(with = "ts_seconds")]
-    created: DateTime<Utc>,
-    #[serde(with = "ts_seconds")]
-    expire: DateTime<Utc>,
+    #[serde(with = "jiff::fmt::serde::timestamp::second::required")]
+    created: Timestamp,
+    #[serde(with = "jiff::fmt::serde::timestamp::second::required")]
+    expire: Timestamp,
 }
 
 impl RocksEntity for QueueItemPayload {
@@ -24,7 +23,7 @@ impl RocksEntity for QueueItemPayload {
 }
 
 impl QueueItemPayload {
-    pub fn new(value: String, created: DateTime<Utc>, expire: DateTime<Utc>) -> Self {
+    pub fn new(value: String, created: Timestamp, expire: Timestamp) -> Self {
         Self {
             value,
             created,
@@ -36,15 +35,15 @@ impl QueueItemPayload {
         &self.value
     }
 
-    pub fn get_created(&self) -> &DateTime<Utc> {
+    pub fn get_created(&self) -> &Timestamp {
         &self.created
     }
 
-    pub fn get_expire(&self) -> &DateTime<Utc> {
+    pub fn get_expire(&self) -> &Timestamp {
         &self.expire
     }
 
-    pub fn set_expire(&mut self, expire: DateTime<Utc>) {
+    pub fn set_expire(&mut self, expire: Timestamp) {
         self.expire = expire;
     }
 }
@@ -118,7 +117,7 @@ impl RocksSecondaryIndex<QueueItemPayload, QueueItemPayloadIndexKey>
         true
     }
 
-    fn get_expire(&self, row: &QueueItemPayload) -> Option<DateTime<Utc>> {
+    fn get_expire(&self, row: &QueueItemPayload) -> Option<Timestamp> {
         Some(row.expire.clone())
     }
 

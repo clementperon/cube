@@ -1,7 +1,7 @@
 use super::{QueryDateTime, SqlInterval};
-use chrono::Utc;
-use chrono_tz::Tz;
 use cubenativeutils::CubeError;
+use jiff::tz::TimeZone;
+use jiff::{SignedDuration, Timestamp};
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::str::FromStr;
@@ -20,9 +20,9 @@ lazy_static! {
 /// to `[start, end]` in `tz`. Returns `None` for anything else.
 pub fn resolve_relative_date_range(
     value: &str,
-    tz: Tz,
+    tz: &TimeZone,
 ) -> Result<Option<(String, String)>, CubeError> {
-    let now = QueryDateTime::new(Utc::now().with_timezone(&tz));
+    let now = QueryDateTime::new(Timestamp::now().to_zoned_datetime(tz.clone()));
     resolve_relative_date_range_at(value, &now)
 }
 
@@ -67,7 +67,7 @@ fn shift(now: &QueryDateTime, unit: &str, n: i64) -> Result<QueryDateTime, CubeE
 fn end_of(date: &QueryDateTime, unit: &str) -> Result<QueryDateTime, CubeError> {
     date.start_of(unit)?
         .add_interval(&SqlInterval::from_str(&format!("1 {}", unit))?)?
-        .add_duration(chrono::Duration::milliseconds(-1))
+        .add_duration(SignedDuration::from_millis(-1))
 }
 
 #[cfg(test)]
@@ -75,7 +75,7 @@ mod tests {
     use super::*;
 
     fn at(value: &str) -> Option<(String, String)> {
-        let now = QueryDateTime::from_date_str(Tz::UTC, "2026-10-07T13:45:10.000").unwrap();
+        let now = QueryDateTime::from_date_str(&TimeZone::UTC, "2026-10-07T13:45:10.000").unwrap();
         resolve_relative_date_range_at(value, &now).unwrap()
     }
 
@@ -142,10 +142,10 @@ mod tests {
     #[test]
     fn resolves_in_the_query_time_zone() {
         // 23:30 UTC on Sep 30 is already Oct 1 in Tokyo.
-        let now = QueryDateTime::from_date_str(Tz::UTC, "2026-09-30T23:30:00.000")
+        let now = QueryDateTime::from_date_str(&TimeZone::UTC, "2026-09-30T23:30:00.000")
             .unwrap()
             .date_time()
-            .with_timezone(&Tz::Asia__Tokyo);
+            .with_time_zone(TimeZone::get("Asia/Tokyo").unwrap());
         assert_eq!(
             resolve_relative_date_range_at("this month", &QueryDateTime::new(now)).unwrap(),
             range("2026-10-01T00:00:00.000", "2026-10-31T23:59:59.999")

@@ -1,8 +1,10 @@
-use crate::compile::engine::{
-    df::scan::{ArrayRef, DataFusionError, DataType, Int32Builder, StringBuilder},
-    udf::{common::ReturnTypeFunction, utils::*},
+use crate::{
+    compile::engine::{
+        df::scan::{ArrayRef, DataFusionError, DataType, Int32Builder, StringBuilder},
+        udf::{common::ReturnTypeFunction, utils::*},
+    },
+    utils::datetime::datetime_from_unix_nanos,
 };
-use chrono::{DateTime, Datelike};
 use datafusion::{
     arrow::{
         array::{Array, PrimitiveArray},
@@ -17,8 +19,8 @@ use regex::Regex;
 use std::{any::type_name, collections::HashMap, convert::TryInto, sync::Arc};
 
 fn months_since_epoch(timestamp_nanos: i64) -> i64 {
-    let date = DateTime::from_timestamp_nanos(timestamp_nanos);
-    (date.year() as i64 - 1970) * 12 + date.month0() as i64
+    let date = datetime_from_unix_nanos(timestamp_nanos);
+    (i64::from(date.year()) - 1970) * 12 + i64::from(date.month()) - 1
 }
 
 // https://docs.aws.amazon.com/redshift/latest/dg/r_DATEDIFF_function.html

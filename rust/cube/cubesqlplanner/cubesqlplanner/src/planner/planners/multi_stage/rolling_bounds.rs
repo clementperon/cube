@@ -9,8 +9,8 @@ use crate::planner::QueryDateTimeHelper;
 use crate::planner::QueryTimeSeries;
 use crate::planner::SeriesSpan;
 use crate::planner::TimeDimensionSymbol;
-use chrono::Duration;
 use cubenativeutils::CubeError;
+use jiff::SignedDuration;
 use std::rc::Rc;
 
 /// Plan-time arithmetic of rolling windows: the span a window's base scan
@@ -86,7 +86,7 @@ impl RollingWindowBounds {
             granularity.align_date_to_origin(QueryDateTime::from_date_str(tz, &date_range[1])?)?;
         let past_end = last
             .add_interval(interval)?
-            .add_duration(Duration::seconds(-1))?;
+            .add_duration(SignedDuration::from_secs(-1))?;
         let past_end = format!("{}.999", past_end.format("%Y-%m-%dT%H:%M:%S"));
         Ok(SeriesSpan {
             from: first.default_format(),

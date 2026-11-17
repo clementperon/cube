@@ -7,9 +7,9 @@ use crate::remotefs::{
 use crate::util::lock::acquire_lock;
 use crate::CubeError;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use datafusion::cube_ext;
 use futures::stream::BoxStream;
+use jiff::Timestamp;
 use log::{debug, info};
 use regex::{NoExpand, Regex};
 use s3::creds::Credentials;
@@ -529,7 +529,7 @@ impl RemoteFs for S3RemoteFs {
         self.list_objects_and_map(remote_prefix, |o: s3::serde_types::Object| {
             Ok(RemoteFile {
                 remote_path: Self::object_key_to_remote_path(&leading_subpath, &o.key),
-                updated: DateTime::parse_from_rfc3339(&o.last_modified)?.with_timezone(&Utc),
+                updated: o.last_modified.parse::<Timestamp>()?,
                 file_size: o.size,
             })
         })

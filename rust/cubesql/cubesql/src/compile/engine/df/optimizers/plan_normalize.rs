@@ -22,10 +22,13 @@ use datafusion::{
     sql::planner::ContextProvider,
 };
 
-use crate::compile::{
-    date_parser::parse_date_str,
-    engine::{udf::CURRENT_TIMESTAMP_STAND_INS, CubeContext},
-    rewrite::rules::utils::DatePartToken,
+use crate::{
+    compile::{
+        date_parser::parse_date_str,
+        engine::{udf::CURRENT_TIMESTAMP_STAND_INS, CubeContext},
+        rewrite::rules::utils::DatePartToken,
+    },
+    utils::datetime::{unix_micros, unix_millis, unix_nanos, unix_seconds},
 };
 
 /// PlanNormalize optimizer rule walks through the query and applies transformations
@@ -1610,21 +1613,21 @@ fn cast_string_literal_expr(
     if let (Expr::Literal(ScalarValue::Utf8(Some(value))), DataType::Timestamp(unit, tz)) =
         (expr, cast_type)
     {
-        let parsed = parse_date_str(value).ok()?.and_utc();
+        let parsed = parse_date_str(value).ok()?;
         let scalar = match unit {
-            TimeUnit::Second => ScalarValue::TimestampSecond(Some(parsed.timestamp()), tz.clone()),
+            TimeUnit::Second => {
+                ScalarValue::TimestampSecond(Some(unix_seconds(parsed)), tz.clone())
+            }
             TimeUnit::Millisecond => {
-                ScalarValue::TimestampMillisecond(Some(parsed.timestamp_millis()), tz.clone())
+                ScalarValue::TimestampMillisecond(Some(unix_millis(parsed)), tz.clone())
             }
             TimeUnit::Microsecond => {
-                ScalarValue::TimestampMicrosecond(Some(parsed.timestamp_micros()), tz.clone())
+                ScalarValue::TimestampMicrosecond(Some(unix_micros(parsed)), tz.clone())
             }
-            TimeUnit::Nanosecond => match parsed.timestamp_nanos_opt() {
+            TimeUnit::Nanosecond => match unix_nanos(parsed) {
                 Some(nanos) => ScalarValue::TimestampNanosecond(Some(nanos), tz.clone()),
                 // Past 2262-04-11: millisecond timestamp, see `fold_date_to_millis`.
-                None => {
-                    ScalarValue::TimestampMillisecond(Some(parsed.timestamp_millis()), tz.clone())
-                }
+                None => ScalarValue::TimestampMillisecond(Some(unix_millis(parsed)), tz.clone()),
             },
         };
         return Some(Box::new(Expr::Literal(scalar)));
@@ -1997,11 +2000,7 @@ mod tests {
             let LogicalPlan::Filter(Filter { predicate, .. }) = &optimized else {
                 panic!("Expected Filter plan, got: {:?}", optimized);
             };
-            let expected_nanos = parse_date_str("2026-06-01")
-                .unwrap()
-                .and_utc()
-                .timestamp_nanos_opt()
-                .unwrap();
+            let expected_nanos = unix_nanos(parse_date_str("2026-06-01").unwrap()).unwrap();
             assert_eq!(
                 *predicate,
                 col("test_table.ts").gt_eq(Expr::Literal(ScalarValue::TimestampNanosecond(

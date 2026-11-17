@@ -4,7 +4,7 @@ use crate::metastore::table::Table;
 use crate::metastore::{RocksEntity, RowKey};
 use crate::rocks_table_impl;
 use byteorder::{BigEndian, WriteBytesExt};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use std::io::{Cursor, Write};
@@ -94,7 +94,7 @@ pub enum JobStatus {
 pub struct Job {
     row_reference: RowKey,
     job_type: JobType,
-    last_heart_beat: DateTime<Utc>,
+    last_heart_beat: Timestamp,
     status: JobStatus,
 }
 
@@ -105,7 +105,7 @@ impl Job {
         Job {
             row_reference,
             job_type,
-            last_heart_beat: Utc::now(),
+            last_heart_beat: Timestamp::now(),
             status: JobStatus::Scheduled(shard),
         }
     }
@@ -118,7 +118,7 @@ impl Job {
         &self.row_reference
     }
 
-    pub fn last_heart_beat(&self) -> &DateTime<Utc> {
+    pub fn last_heart_beat(&self) -> &Timestamp {
         &self.last_heart_beat
     }
 
@@ -130,7 +130,7 @@ impl Job {
         Job {
             row_reference: self.row_reference.clone(),
             job_type: self.job_type.clone(),
-            last_heart_beat: Utc::now(),
+            last_heart_beat: Timestamp::now(),
             status,
         }
     }
@@ -353,14 +353,14 @@ mod tests {
         struct NewerJob {
             row_reference: RowKey,
             job_type: NewerJobType,
-            last_heart_beat: DateTime<Utc>,
+            last_heart_beat: Timestamp,
             status: JobStatus,
         }
 
         let newer = NewerJob {
             row_reference: RowKey::Table(TableId::Jobs, 1),
             job_type: NewerJobType::BrandNewDataVariant("payload".to_string()),
-            last_heart_beat: Utc::now(),
+            last_heart_beat: Timestamp::now(),
             status: JobStatus::Scheduled("shard-1".to_string()),
         };
         let decoded: Job = flex_roundtrip(&newer).expect("job with unknown type must decode");

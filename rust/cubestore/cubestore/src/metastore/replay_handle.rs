@@ -4,8 +4,8 @@ use crate::metastore::{IdRow, RocksEntity};
 use crate::rocks_table_impl;
 use crate::{base_rocks_secondary_index, CubeError};
 use byteorder::{BigEndian, WriteBytesExt};
-use chrono::{DateTime, Utc};
 use itertools::Itertools;
+use jiff::Timestamp;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt::Debug;
@@ -14,7 +14,7 @@ crate::data_frame_from! {
 #[derive(Clone, Serialize, Deserialize, Debug, Hash)]
 pub struct ReplayHandle {
     table_id: u64,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     seq_pointers_by_location: Option<Vec<Option<SeqPointer>>>,
     has_failed_to_persist_chunks: bool
 }
@@ -116,7 +116,7 @@ impl ReplayHandle {
     ) -> Self {
         Self {
             table_id,
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             has_failed_to_persist_chunks: false,
             seq_pointers_by_location,
         }
@@ -141,7 +141,7 @@ impl ReplayHandle {
         seq_pointers_by_location[location_index] = Some(seq_pointer);
         Ok(Self {
             table_id: table.get_id(),
-            created_at: Utc::now(),
+            created_at: Timestamp::now(),
             has_failed_to_persist_chunks: false,
             seq_pointers_by_location: Some(seq_pointers_by_location),
         })
@@ -151,7 +151,7 @@ impl ReplayHandle {
         self.table_id
     }
 
-    pub fn created_at(&self) -> &DateTime<Utc> {
+    pub fn created_at(&self) -> &Timestamp {
         &self.created_at
     }
 

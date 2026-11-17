@@ -45,6 +45,51 @@ async fn test_basic_pre_agg_sql() -> Result<(), CubeError> {
     Ok(())
 }
 
+// `9999-12-31` is a common "no upper bound". The instant after such a range ends is in
+// year 10000, past every date; matching must read it as a year boundary rather than fail.
+#[test]
+fn test_pre_agg_matches_date_range_closing_at_end_of_year_9999() -> Result<(), CubeError> {
+    let schema = MockSchema::from_yaml_file("common/pre_aggregations_test.yaml");
+
+    for timezone in ["UTC", "America/Los_Angeles", "Pacific/Kiritimati"] {
+        let test_context = TestContext::new_with_timezone(
+            schema.clone(),
+            jiff::tz::TimeZone::get(timezone).unwrap(),
+        )?;
+
+        for date_range in [
+            r#"["2024-01-01", "9999-12-31"]"#,
+            r#"["2024-01-01T00:00:00.000", "9999-12-31T23:59:59.999"]"#,
+        ] {
+            let query_yaml = format!(
+                indoc! {"
+                    measures:
+                      - visitors.count
+                    dimensions:
+                      - visitors.source
+                    time_dimensions:
+                      - dimension: visitors.created_at
+                        granularity: day
+                        dateRange: {}
+                "},
+                date_range
+            );
+
+            let (_sql, pre_aggrs) =
+                test_context.build_sql_with_used_pre_aggregations(&query_yaml)?;
+
+            assert_eq!(pre_aggrs.len(), 1, "{timezone} {date_range}");
+            assert_eq!(
+                pre_aggrs[0].name(),
+                "daily_rollup",
+                "{timezone} {date_range}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_full_match_main_rollup() -> Result<(), CubeError> {
     let schema = MockSchema::from_yaml_file("common/pre_aggregation_matching_test.yaml")

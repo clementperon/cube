@@ -7,9 +7,9 @@
 
 use crate::test_fixtures::cube_bridge::MockSchema;
 use crate::test_fixtures::test_utils::TestContext;
-use chrono_tz::Tz;
 use indoc::indoc;
 use itertools::Itertools;
+use jiff::tz::TimeZone;
 
 const SEED: &str = "integration_multi_fact_tables.sql";
 const YAML: &str = "common/integration_multi_stage_windows_pre_agg.yaml";
@@ -234,8 +234,10 @@ async fn test_windows_by_day_in_non_utc_timezone() {
     // Each window's condition must render against the stored column the way
     // the scan's filter does. The rollup is built in UTC, so the source tables
     // are left out of the comparison.
-    for tz in [Tz::America__Los_Angeles, Tz::Asia__Kamchatka] {
-        let ctx = TestContext::new_with_timezone(schema_with_rollup(false), tz).unwrap();
+    for tz in ["America/Los_Angeles", "Asia/Kamchatka"] {
+        let ctx =
+            TestContext::new_with_timezone(schema_with_rollup(false), TimeZone::get(tz).unwrap())
+                .unwrap();
         let query = indoc! {"
             measures:
               - orders.amount_all_week

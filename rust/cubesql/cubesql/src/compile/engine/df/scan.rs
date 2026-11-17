@@ -7,10 +7,10 @@ use crate::{
     config::ConfigObj,
     sql::{dataframe::Decimal128Value, AuthContextRef},
     transport::{CubeStreamReceiver, LoadRequestMeta, SpanId, TransportService},
+    utils::datetime::{unix_days, unix_millis, unix_nanos},
     CubeError, CubeErrorCauseType,
 };
 use async_trait::async_trait;
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use cubeclient::models::{
     V1LoadRequestQuery, V1LoadResponse, V1LoadResult, V1LoadResultDataColumnar,
 };
@@ -819,7 +819,7 @@ fn append_timestamp_nanosecond(
         FieldValue::String(s) => {
             let timestamp = parse_date_str(s.as_ref())?;
             // TODO switch parsing to microseconds
-            if let Some(nanos) = timestamp.and_utc().timestamp_nanos_opt() {
+            if let Some(nanos) = unix_nanos(timestamp) {
                 builder.append_value(nanos);
             } else {
                 log::error!(
@@ -849,7 +849,7 @@ fn append_timestamp_millisecond(
         FieldValue::Null => builder.append_null(),
         FieldValue::String(s) => {
             let timestamp = parse_date_str(s.as_ref())?;
-            builder.append_value(timestamp.and_utc().timestamp_millis());
+            builder.append_value(unix_millis(timestamp));
         }
         v => {
             return Err(unmapped_value(
@@ -870,12 +870,7 @@ fn append_date32(
     match value {
         FieldValue::Null => builder.append_null(),
         FieldValue::String(s) => match parse_date_str(s.as_ref()) {
-            Ok(timestamp) => {
-                let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                let days_since_epoch =
-                    timestamp.date().num_days_from_ce() - epoch.num_days_from_ce();
-                builder.append_value(days_since_epoch);
-            }
+            Ok(timestamp) => builder.append_value(unix_days(timestamp.date())),
             Err(error) => {
                 log::error!("Unable to parse value as Date32: {}", error);
                 builder.append_null()
@@ -1415,10 +1410,8 @@ async fn load_data(
                 let metadata = schema.metadata();
 
                 if let Some(last_refresh_time) = metadata.get("lastRefreshTime") {
-                    if let Ok(last_refresh_time) = DateTime::parse_from_rfc3339(last_refresh_time) {
-                        span_id
-                            .set_last_refresh_time(last_refresh_time.with_timezone(&Utc))
-                            .await;
+                    if let Ok(last_refresh_time) = last_refresh_time.parse::<jiff::Timestamp>() {
+                        span_id.set_last_refresh_time(last_refresh_time).await;
                     }
                 }
 

@@ -20,8 +20,8 @@ use std::fmt::Debug;
 use std::io::{Cursor, Read, Write};
 
 use crate::metastore::snapshot_info::SnapshotInfo;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use cuberockstore::rocksdb;
+use jiff::{SignedDuration, Timestamp};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -147,7 +147,7 @@ pub struct RocksSecondaryIndexValueTTLExtended {
     // Approximate counter of usage
     pub lfu: u8,
     // Last access time
-    pub lru: Option<DateTime<Utc>>,
+    pub lru: Option<Timestamp>,
     // Raw size of table's value without compression
     pub raw_size: u32,
 }
@@ -173,10 +173,10 @@ pub struct RocksPropertyRow {
 #[derive(Debug)]
 pub enum RocksSecondaryIndexValue<'a> {
     Hash(&'a [u8]),
-    HashAndTTL(&'a [u8], Option<DateTime<Utc>>),
+    HashAndTTL(&'a [u8], Option<Timestamp>),
     HashAndTTLExtended(
         &'a [u8],
-        Option<DateTime<Utc>>,
+        Option<Timestamp>,
         RocksSecondaryIndexValueTTLExtended,
     ),
 }
@@ -190,40 +190,33 @@ pub enum RocksSecondaryIndexValueVersion {
 
 pub type PackedDateTime = u32;
 
-fn base_date_epoch() -> NaiveDateTime {
-    NaiveDate::from_ymd_opt(2022, 1, 1)
-        .unwrap()
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-}
+/// 2022-01-01T00:00:00Z, the epoch for timestamps packed as `u32` seconds.
+const BASE_DATE_EPOCH: Timestamp = Timestamp::constant(1_640_995_200, 0);
 
 pub trait RocksSecondaryIndexValueVersionEncoder {
     fn encode_value_as_u32(&self) -> Result<u32, CubeError>;
 }
 
 pub trait RocksSecondaryIndexValueVersionDecoder {
-    fn decode_value_as_opt_datetime(self) -> Result<Option<DateTime<Utc>>, CubeError>;
+    fn decode_value_as_opt_datetime(self) -> Result<Option<Timestamp>, CubeError>;
 }
 
 impl RocksSecondaryIndexValueVersionDecoder for u32 {
-    fn decode_value_as_opt_datetime(self) -> Result<Option<DateTime<Utc>>, CubeError> {
+    fn decode_value_as_opt_datetime(self) -> Result<Option<Timestamp>, CubeError> {
         if self == 0 {
             return Ok(None);
         }
 
-        let timestamp = DateTime::<Utc>::from_naive_utc_and_offset(base_date_epoch(), Utc)
-            + chrono::Duration::seconds(self as i64);
+        // Cannot overflow: `u32::MAX` seconds past the base epoch is in 2158.
+        let timestamp = BASE_DATE_EPOCH + SignedDuration::from_secs(self as i64);
 
         Ok(Some(timestamp))
     }
 }
 
-impl RocksSecondaryIndexValueVersionEncoder for DateTime<Utc> {
+impl RocksSecondaryIndexValueVersionEncoder for Timestamp {
     fn encode_value_as_u32(&self) -> Result<u32, CubeError> {
-        let seconds = self
-            .naive_local()
-            .signed_duration_since(base_date_epoch())
-            .num_seconds();
+        let seconds = self.duration_since(BASE_DATE_EPOCH).as_secs();
 
         u32::try_from(seconds).map_err(|err| {
             CubeError::internal(format!("Unable to represent datetime as u32: {}", err))
@@ -231,7 +224,7 @@ impl RocksSecondaryIndexValueVersionEncoder for DateTime<Utc> {
     }
 }
 
-impl RocksSecondaryIndexValueVersionEncoder for Option<DateTime<Utc>> {
+impl RocksSecondaryIndexValueVersionEncoder for Option<Timestamp> {
     fn encode_value_as_u32(&self) -> Result<u32, CubeError> {
         match self {
             None => Ok(0),
@@ -269,11 +262,9 @@ impl<'a> RocksSecondaryIndexValue<'a> {
                     let expire = if expire_timestamp == 0 {
                         None
                     } else {
-                        Some(
-                            DateTime::<Utc>::from_timestamp(expire_timestamp, 0).ok_or_else(
-                                || CubeError::internal("timestamp out of range".to_owned()),
-                            )?,
-                        )
+                        Some(Timestamp::from_second(expire_timestamp).map_err(|_| {
+                            CubeError::internal("timestamp out of range".to_owned())
+                        })?)
                     };
 
                     Ok(RocksSecondaryIndexValue::HashAndTTL(&hash, expire))
@@ -351,7 +342,7 @@ impl<'a> RocksSecondaryIndexValue<'a> {
                     buf.write_all(&hash)?;
 
                     if let Some(ex) = expire {
-                        buf.write_i64::<BigEndian>(ex.timestamp())?
+                        buf.write_i64::<BigEndian>(ex.as_second())?
                     } else {
                         buf.write_i64::<BigEndian>(0)?
                     }
@@ -681,7 +672,7 @@ pub struct DbTableRef<'a> {
     pub db: &'a DB,
     pub snapshot: &'a Snapshot<'a>,
     pub mem_seq: MemorySequence,
-    pub start_time: DateTime<Utc>,
+    pub start_time: Timestamp,
 }
 
 #[async_trait]
@@ -1000,7 +991,7 @@ impl RocksStore {
                 db: &meta_store_to_move.db,
                 snapshot: &meta_store_to_move.db.snapshot(),
                 mem_seq: MemorySequence::new(meta_store_to_move.seq_store.clone()),
-                start_time: Utc::now(),
+                start_time: Timestamp::now(),
             };
 
             if let Err(e) = meta_store_to_move.details.migrate(table_ref) {
@@ -1106,7 +1097,7 @@ impl RocksStore {
                         db: db_to_send.as_ref(),
                         snapshot: &snapshot,
                         mem_seq,
-                        start_time: Utc::now(),
+                        start_time: Timestamp::now(),
                     },
                     &mut batch,
                 );
@@ -1436,7 +1427,7 @@ impl RocksStore {
                 db: db_to_send.as_ref(),
                 snapshot: &snapshot,
                 mem_seq,
-                start_time: Utc::now(),
+                start_time: Timestamp::now(),
             });
 
             tx.send(res).map_err(|_| {
@@ -1492,7 +1483,7 @@ impl RocksStore {
                 db: db_to_send.as_ref(),
                 snapshot: &snapshot,
                 mem_seq,
-                start_time: Utc::now(),
+                start_time: Timestamp::now(),
             });
 
             mem::drop(span_holder);
@@ -1577,15 +1568,13 @@ mod tests {
     use crate::metastore::Schema;
     use crate::metastore::{BaseRocksStoreFs, RocksMetaStoreDetails};
     use crate::remotefs::LocalDirRemoteFs;
-    use chrono::Timelike;
     use std::{env, fs};
 
     #[test]
     fn test_rocks_secondary_index_encoding_with_ttl() -> Result<(), CubeError> {
         let hash = &[1, 2, 3, 4, 5];
         let expire = Some(
-            Utc::now()
-                .with_nanosecond(0)
+            Timestamp::from_second(Timestamp::now().as_second())
                 .expect("Should truncate nanos, because we dont truncate it"),
         );
 
@@ -1611,15 +1600,13 @@ mod tests {
     fn test_rocks_secondary_index_encoding_with_ttl_and_info() -> Result<(), CubeError> {
         let hash = &[1, 2, 3, 4, 5];
         let expire = Some(
-            Utc::now()
-                .with_nanosecond(0)
+            Timestamp::from_second(Timestamp::now().as_second())
                 .expect("Should truncate nanos, because we dont truncate it"),
         );
         let info = RocksSecondaryIndexValueTTLExtended {
             lfu: 1,
             lru: Some(
-                Utc::now()
-                    .with_nanosecond(0)
+                Timestamp::from_second(Timestamp::now().as_second())
                     .expect("Should truncate nanos, because we dont truncate it"),
             ),
             raw_size: 1024,

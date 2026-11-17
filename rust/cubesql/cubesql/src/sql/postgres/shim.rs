@@ -1134,7 +1134,7 @@ impl AsyncPostgresShim {
                 parse.name,
                 PreparedStatement::Empty {
                     from_sql: false,
-                    created: chrono::offset::Utc::now(),
+                    created: jiff::Timestamp::now(),
                     span_id: span_id.clone(),
                 },
             );
@@ -1260,7 +1260,7 @@ impl AsyncPostgresShim {
                         (
                             PreparedStatement::Query {
                                 from_sql,
-                                created: chrono::offset::Utc::now(),
+                                created: jiff::Timestamp::now(),
                                 query: Box::new(query),
                                 parameters: protocol::ParameterDescription::new(parameters),
                                 description,
@@ -1274,7 +1274,7 @@ impl AsyncPostgresShim {
                         PreparedStatement::Error {
                             from_sql,
                             sql: query.to_string(),
-                            created: chrono::offset::Utc::now(),
+                            created: jiff::Timestamp::now(),
                             span_id,
                         },
                         Err(err.into()),
@@ -1285,7 +1285,7 @@ impl AsyncPostgresShim {
                 PreparedStatement::Error {
                     from_sql,
                     sql,
-                    created: chrono::offset::Utc::now(),
+                    created: jiff::Timestamp::now(),
                     span_id,
                 },
                 Ok(()),

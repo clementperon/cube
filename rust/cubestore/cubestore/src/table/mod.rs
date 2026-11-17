@@ -1,6 +1,7 @@
 use crate::metastore::ColumnType;
 use crate::util::decimal::{Decimal, Decimal96};
 use crate::util::int96::Int96;
+use crate::util::time::{timestamp_from_unix_nanos, to_rfc3339_millis};
 
 use datafusion::arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Decimal128Array, Float64Array, Int64Array,
@@ -9,7 +10,6 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 
 use crate::cube_ext::ordfloat::OrdF64;
-use chrono::{SecondsFormat, TimeZone, Utc};
 use deepsize::{Context, DeepSizeOf};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -188,8 +188,7 @@ impl Debug for TimestampValue {
 
 impl ToString for TimestampValue {
     fn to_string(&self) -> String {
-        Utc.timestamp_nanos(self.unix_nano)
-            .to_rfc3339_opts(SecondsFormat::Millis, true)
+        to_rfc3339_millis(timestamp_from_unix_nanos(self.unix_nano))
     }
 }
 

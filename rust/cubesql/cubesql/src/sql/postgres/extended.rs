@@ -9,8 +9,8 @@ use crate::{
     },
     CubeError,
 };
-use chrono::{DateTime, Utc};
 use datafusion::arrow::record_batch::RecordBatch;
+use jiff::Timestamp;
 use pg_srv::{protocol, BindValue, PgTypeId, ProtocolError};
 use sqlparser::ast;
 use std::{
@@ -130,13 +130,13 @@ pub enum PreparedStatement {
     Empty {
         /// Prepared statement can be declared from SQL or protocol (Parser)
         from_sql: bool,
-        created: DateTime<Utc>,
+        created: Timestamp,
         span_id: Option<Arc<SpanId>>,
     },
     Query {
         /// Prepared statement can be declared from SQL or protocol (Parser)
         from_sql: bool,
-        created: DateTime<Utc>,
+        created: Timestamp,
         query: Box<ast::Statement>,
         parameters: protocol::ParameterDescription,
         /// Fields which will be returned to the client; It can be None if the server doesn't return any field,
@@ -151,13 +151,13 @@ pub enum PreparedStatement {
         /// Prepared statement can be declared from SQL or protocol (Parser)
         from_sql: bool,
         sql: String,
-        created: DateTime<Utc>,
+        created: Timestamp,
         span_id: Option<Arc<SpanId>>,
     },
 }
 
 impl PreparedStatement {
-    pub fn get_created(&self) -> &DateTime<Utc> {
+    pub fn get_created(&self) -> &Timestamp {
         match self {
             PreparedStatement::Empty { created, .. } => created,
             PreparedStatement::Query { created, .. } => created,

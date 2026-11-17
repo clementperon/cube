@@ -4,9 +4,8 @@ use crate::metastore::{
 };
 use crate::table::{Row, TableValue};
 use crate::{base_rocks_secondary_index, rocks_table_new, CubeError};
-use chrono::serde::{ts_seconds, ts_seconds_option};
-use chrono::{DateTime, Duration, Utc};
 use cuberockstore::rocksdb::WriteBatch;
+use jiff::{SignedDuration, Timestamp};
 use std::cmp::{max, Ordering};
 
 use crate::cachestore::QueueKey;
@@ -78,14 +77,14 @@ pub struct QueueItem {
     pub(crate) status: QueueItemStatus,
     #[serde(default)]
     priority: i64,
-    #[serde(with = "ts_seconds")]
-    created: DateTime<Utc>,
-    #[serde(with = "ts_seconds_option")]
-    pub(crate) heartbeat: Option<DateTime<Utc>>,
-    #[serde(with = "ts_seconds_option")]
-    orphaned: Option<DateTime<Utc>>,
-    #[serde(with = "ts_seconds")]
-    expire: DateTime<Utc>,
+    #[serde(with = "jiff::fmt::serde::timestamp::second::required")]
+    created: Timestamp,
+    #[serde(with = "jiff::fmt::serde::timestamp::second::optional")]
+    pub(crate) heartbeat: Option<Timestamp>,
+    #[serde(with = "jiff::fmt::serde::timestamp::second::optional")]
+    orphaned: Option<Timestamp>,
+    #[serde(with = "jiff::fmt::serde::timestamp::second::required")]
+    expire: Timestamp,
     #[serde(default)]
     pub(crate) process_id: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -145,7 +144,7 @@ impl QueueItem {
         external_id: Option<String>,
     ) -> Self {
         let (prefix, key) = QueueItem::parse_path(path);
-        let created = Utc::now();
+        let created = Timestamp::now();
 
         QueueItem {
             prefix,
@@ -155,7 +154,7 @@ impl QueueItem {
             extra: None,
             heartbeat: None,
             orphaned: if let Some(orphaned) = orphaned {
-                Some(created + Duration::seconds(orphaned as i64))
+                Some(created + SignedDuration::from_secs(orphaned as i64))
             } else {
                 None
             },
@@ -163,11 +162,11 @@ impl QueueItem {
             expire: if let Some(orphaned) = orphaned {
                 created
                     + max(
-                        Duration::seconds(orphaned as i64) + Duration::hours(2),
-                        Duration::hours(4),
+                        SignedDuration::from_secs(orphaned as i64) + SignedDuration::from_hours(2),
+                        SignedDuration::from_hours(4),
                     )
             } else {
-                created.clone() + Duration::hours(4)
+                created.clone() + SignedDuration::from_hours(4)
             },
             created,
             process_id,
@@ -214,19 +213,19 @@ impl QueueItem {
         &self.status
     }
 
-    pub fn get_heartbeat(&self) -> &Option<DateTime<Utc>> {
+    pub fn get_heartbeat(&self) -> &Option<Timestamp> {
         &self.heartbeat
     }
 
-    pub fn get_created(&self) -> &DateTime<Utc> {
+    pub fn get_created(&self) -> &Timestamp {
         &self.created
     }
 
-    pub fn get_orphaned(&self) -> &Option<DateTime<Utc>> {
+    pub fn get_orphaned(&self) -> &Option<Timestamp> {
         &self.orphaned
     }
 
-    pub fn get_expire(&self) -> &DateTime<Utc> {
+    pub fn get_expire(&self) -> &Timestamp {
         &self.expire
     }
 
@@ -261,26 +260,26 @@ impl QueueItem {
     }
 
     pub fn update_heartbeat(&mut self) {
-        self.heartbeat = Some(Utc::now());
+        self.heartbeat = Some(Timestamp::now());
     }
 
     /// A re-add leaves at least `orphaned` seconds before the item is orphaned, writing at most once
     /// per half timeout (the deadline is set to 1.5× and only rewritten once less than 1×
     /// is left). `None` when nothing is written, otherwise whether the expiry moved too.
     pub fn touch_orphaned(&mut self, orphaned: u32) -> Option<bool> {
-        let now = Utc::now();
-        let timeout = Duration::seconds(orphaned as i64);
+        let now = Timestamp::now();
+        let timeout = SignedDuration::from_secs(orphaned as i64);
         if let Some(current) = self.orphaned {
             if current >= now + timeout {
                 return None;
             }
         }
 
-        let deadline = now + timeout + Duration::seconds((orphaned / 2) as i64);
+        let deadline = now + timeout + SignedDuration::from_secs((orphaned / 2) as i64);
 
         self.orphaned = Some(deadline);
 
-        let min_expire = deadline + Duration::hours(2);
+        let min_expire = deadline + SignedDuration::from_hours(2);
         if self.expire < min_expire {
             self.expire = min_expire;
 
@@ -515,7 +514,7 @@ impl RocksSecondaryIndex<QueueItem, QueueItemIndexKey> for QueueItemRocksIndex {
         true
     }
 
-    fn get_expire(&self, row: &QueueItem) -> Option<DateTime<Utc>> {
+    fn get_expire(&self, row: &QueueItem) -> Option<Timestamp> {
         Some(row.expire.clone())
     }
 
@@ -602,7 +601,7 @@ mod tests {
             &mut priority0_5,
             &mut priority_n5_6,
         ]) {
-            item.created = priority0_1.created + Duration::milliseconds(i);
+            item.created = priority0_1.created + SignedDuration::from_millis(i);
         }
 
         assert_eq!(

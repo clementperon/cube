@@ -1,5 +1,6 @@
-use chrono::{Datelike, Duration, Months, NaiveDate, NaiveDateTime, Timelike};
 use cubenativeutils::CubeError;
+use jiff::civil::{Date, DateTime};
+use jiff::{SignedDuration, Span};
 use std::str::FromStr;
 
 use super::date_time_helper::QueryDateTimeHelper;
@@ -127,7 +128,10 @@ impl QueryTimeSeries {
         let range_end = QueryDateTimeHelper::parse_native_date_time(&date_range[1])?;
         let first = predefined_bucket(granularity, range_start, timestamp_precision)?;
         let last = predefined_bucket(granularity, range_end, timestamp_precision)?;
-        let past_end = add_interval_to_dt(range_end, interval)? - Duration::seconds(1);
+        let past_end = add_duration(
+            add_interval_to_dt(range_end, interval)?,
+            SignedDuration::from_secs(-1),
+        )?;
         let nines = "9".repeat(timestamp_precision as usize);
         Ok(SeriesSpan {
             from: first.start_str,
@@ -188,7 +192,7 @@ impl QueryTimeSeries {
                     "Custom interval did not advance the cursor".to_string(),
                 ));
             }
-            let bucket_end = next - Duration::seconds(1);
+            let bucket_end = add_duration(next, SignedDuration::from_secs(-1))?;
             buckets.push(vec![
                 format_with_padding(aligned, &zeros),
                 format_with_padding(bucket_end, &nines),
@@ -200,10 +204,10 @@ impl QueryTimeSeries {
 }
 
 struct BucketWindow {
-    bucket_start: NaiveDateTime,
+    bucket_start: DateTime,
     start_str: String,
     end_str: String,
-    next: NaiveDateTime,
+    next: DateTime,
 }
 
 fn check_precision(precision: u32) -> Result<(), CubeError> {
@@ -217,18 +221,15 @@ fn check_precision(precision: u32) -> Result<(), CubeError> {
 
 fn predefined_bucket(
     granularity: &str,
-    pos: NaiveDateTime,
+    pos: DateTime,
     precision: u32,
 ) -> Result<BucketWindow, CubeError> {
     let zeros = "0".repeat(precision as usize);
     let nines = "9".repeat(precision as usize);
     let res = match granularity {
         "second" => {
-            let start = pos
-                .date()
-                .and_hms_opt(pos.hour(), pos.minute(), pos.second())
-                .unwrap();
-            let next = start + Duration::seconds(1);
+            let start = pos.date().at(pos.hour(), pos.minute(), pos.second(), 0);
+            let next = add_duration(start, SignedDuration::from_secs(1))?;
             BucketWindow {
                 bucket_start: start,
                 start_str: format!(
@@ -249,8 +250,8 @@ fn predefined_bucket(
             }
         }
         "minute" => {
-            let start = pos.date().and_hms_opt(pos.hour(), pos.minute(), 0).unwrap();
-            let next = start + Duration::minutes(1);
+            let start = pos.date().at(pos.hour(), pos.minute(), 0, 0);
+            let next = add_duration(start, SignedDuration::from_mins(1))?;
             BucketWindow {
                 bucket_start: start,
                 start_str: format!(
@@ -269,8 +270,8 @@ fn predefined_bucket(
             }
         }
         "hour" => {
-            let start = pos.date().and_hms_opt(pos.hour(), 0, 0).unwrap();
-            let next = start + Duration::hours(1);
+            let start = pos.date().at(pos.hour(), 0, 0, 0);
+            let next = add_duration(start, SignedDuration::from_hours(1))?;
             BucketWindow {
                 bucket_start: start,
                 start_str: format!("{}T{:02}:00:00.{zeros}", start.date(), start.hour()),
@@ -279,8 +280,8 @@ fn predefined_bucket(
             }
         }
         "day" => {
-            let start = pos.date().and_hms_opt(0, 0, 0).unwrap();
-            let next = start + Duration::days(1);
+            let start = pos.date().at(0, 0, 0, 0);
+            let next = add_days(pos.date(), 1)?.at(0, 0, 0, 0);
             BucketWindow {
                 bucket_start: start,
                 start_str: format!("{}T00:00:00.{zeros}", start.date()),
@@ -291,12 +292,12 @@ fn predefined_bucket(
         "week" => {
             // ISO week: Monday-anchored.
             let weekday = pos.date().weekday();
-            // Monday=0 .. Sunday=6 (chrono uses num_days_from_monday()).
-            let from_monday = weekday.num_days_from_monday() as i64;
-            let monday = pos.date() - Duration::days(from_monday);
-            let sunday = monday + Duration::days(6);
-            let start = monday.and_hms_opt(0, 0, 0).unwrap();
-            let next = start + Duration::weeks(1);
+            // Monday=0 .. Sunday=6.
+            let from_monday = weekday.to_monday_zero_offset() as i64;
+            let monday = add_days(pos.date(), -from_monday)?;
+            let sunday = add_days(monday, 6)?;
+            let start = monday.at(0, 0, 0, 0);
+            let next = add_days(monday, 7)?.at(0, 0, 0, 0);
             BucketWindow {
                 bucket_start: start,
                 start_str: format!("{}T00:00:00.{zeros}", monday),
@@ -305,43 +306,44 @@ fn predefined_bucket(
             }
         }
         "month" => {
-            let first = NaiveDate::from_ymd_opt(pos.year(), pos.month(), 1)
-                .ok_or_else(|| CubeError::user(format!("Invalid date in bucket for {pos}")))?;
+            let first = Date::new(pos.year(), pos.month(), 1)
+                .map_err(|_| CubeError::user(format!("Invalid date in bucket for {pos}")))?;
             let next_first = add_months(first, 1)?;
-            let last = next_first - Duration::days(1);
-            let start = first.and_hms_opt(0, 0, 0).unwrap();
+            let last = add_days(next_first, -1)?;
+            let start = first.at(0, 0, 0, 0);
             BucketWindow {
                 bucket_start: start,
                 start_str: format!("{}T00:00:00.{zeros}", first),
                 end_str: format!("{}T23:59:59.{nines}", last),
-                next: next_first.and_hms_opt(0, 0, 0).unwrap(),
+                next: next_first.at(0, 0, 0, 0),
             }
         }
         "quarter" => {
             // Quarter starts: Jan, Apr, Jul, Oct.
             let qmonth = ((pos.month() - 1) / 3) * 3 + 1;
-            let first = NaiveDate::from_ymd_opt(pos.year(), qmonth, 1)
-                .ok_or_else(|| CubeError::user(format!("Invalid quarter start for {pos}")))?;
+            let first = Date::new(pos.year(), qmonth, 1)
+                .map_err(|_| CubeError::user(format!("Invalid quarter start for {pos}")))?;
             let next_first = add_months(first, 3)?;
-            let last = next_first - Duration::days(1);
-            let start = first.and_hms_opt(0, 0, 0).unwrap();
+            let last = add_days(next_first, -1)?;
+            let start = first.at(0, 0, 0, 0);
             BucketWindow {
                 bucket_start: start,
                 start_str: format!("{}T00:00:00.{zeros}", first),
                 end_str: format!("{}T23:59:59.{nines}", last),
-                next: next_first.and_hms_opt(0, 0, 0).unwrap(),
+                next: next_first.at(0, 0, 0, 0),
             }
         }
         "year" => {
-            let first = NaiveDate::from_ymd_opt(pos.year(), 1, 1).unwrap();
-            let next_first = NaiveDate::from_ymd_opt(pos.year() + 1, 1, 1).unwrap();
-            let last = next_first - Duration::days(1);
-            let start = first.and_hms_opt(0, 0, 0).unwrap();
+            let first = Date::new(pos.year(), 1, 1)
+                .map_err(|_| CubeError::user(format!("Invalid date in bucket for {pos}")))?;
+            let next_first = add_months(first, 12)?;
+            let last = add_days(next_first, -1)?;
+            let start = first.at(0, 0, 0, 0);
             BucketWindow {
                 bucket_start: start,
                 start_str: format!("{}T00:00:00.{zeros}", first),
                 end_str: format!("{}T23:59:59.{nines}", last),
-                next: next_first.and_hms_opt(0, 0, 0).unwrap(),
+                next: next_first.at(0, 0, 0, 0),
             }
         }
         other => {
@@ -353,26 +355,38 @@ fn predefined_bucket(
     Ok(res)
 }
 
-fn add_months(date: NaiveDate, months: u32) -> Result<NaiveDate, CubeError> {
-    date.checked_add_months(Months::new(months)).ok_or_else(|| {
+fn add_duration(dt: DateTime, duration: SignedDuration) -> Result<DateTime, CubeError> {
+    dt.checked_add(duration)
+        .map_err(|_| CubeError::user(format!("Date overflow adding {duration:?} to {dt}")))
+}
+
+fn add_days(date: Date, days: i64) -> Result<Date, CubeError> {
+    QueryDateTimeHelper::add_days(date, days)
+        .ok_or_else(|| CubeError::user(format!("Date overflow adding {days} days to {date}")))
+}
+
+fn add_months(date: Date, months: u32) -> Result<Date, CubeError> {
+    shift_months(date, months as i64).ok_or_else(|| {
         CubeError::user(format!(
             "Date overflow when adding {months} months to {date}"
         ))
     })
 }
 
-fn sub_months(date: NaiveDate, months: u32) -> Result<NaiveDate, CubeError> {
-    date.checked_sub_months(Months::new(months)).ok_or_else(|| {
+fn sub_months(date: Date, months: u32) -> Result<Date, CubeError> {
+    shift_months(date, -(months as i64)).ok_or_else(|| {
         CubeError::user(format!(
             "Date overflow when subtracting {months} months from {date}"
         ))
     })
 }
 
-fn add_interval_to_dt(
-    dt: NaiveDateTime,
-    interval: &SqlInterval,
-) -> Result<NaiveDateTime, CubeError> {
+/// `date` moved by whole months, the day clamped to the target month's last.
+fn shift_months(date: Date, months: i64) -> Option<Date> {
+    date.checked_add(Span::new().try_months(months).ok()?).ok()
+}
+
+fn add_interval_to_dt(dt: DateTime, interval: &SqlInterval) -> Result<DateTime, CubeError> {
     // `SqlInterval` is field-based, so the written order of the source string
     // is already lost. Units are applied months → days → sub-day; month-end
     // clamping (e.g. Mar 31 + 1 month → Apr 30) therefore happens before days
@@ -384,24 +398,20 @@ fn add_interval_to_dt(
     date = apply_months(date, total_months)?;
     let extra_days = interval.week * 7 + interval.day;
     if extra_days != 0 {
-        date = date
-            .checked_add_signed(Duration::days(extra_days as i64))
+        date = QueryDateTimeHelper::add_days(date, extra_days as i64)
             .ok_or_else(|| CubeError::user(format!("Date overflow adding days to {dt}")))?;
     }
-    // Sub-day part: lower into a Duration and add to the combined dt.
-    let sub_day = Duration::hours(interval.hour as i64)
-        + Duration::minutes(interval.minute as i64)
-        + Duration::seconds(interval.second as i64);
-    let combined = date.and_time(time);
+    // Sub-day part: lower into a duration and add to the combined dt.
+    let sub_day = SignedDuration::from_hours(interval.hour as i64)
+        + SignedDuration::from_mins(interval.minute as i64)
+        + SignedDuration::from_secs(interval.second as i64);
+    let combined = DateTime::from_parts(date, time);
     combined
-        .checked_add_signed(sub_day)
-        .ok_or_else(|| CubeError::user(format!("Date overflow adding sub-day to {dt}")))
+        .checked_add(sub_day)
+        .map_err(|_| CubeError::user(format!("Date overflow adding sub-day to {dt}")))
 }
 
-fn sub_interval_from_dt(
-    dt: NaiveDateTime,
-    interval: &SqlInterval,
-) -> Result<NaiveDateTime, CubeError> {
+fn sub_interval_from_dt(dt: DateTime, interval: &SqlInterval) -> Result<DateTime, CubeError> {
     let neg = SqlInterval::new(
         -interval.year,
         -interval.quarter,
@@ -415,7 +425,7 @@ fn sub_interval_from_dt(
     add_interval_to_dt(dt, &neg)
 }
 
-fn apply_months(date: NaiveDate, months_signed: i32) -> Result<NaiveDate, CubeError> {
+fn apply_months(date: Date, months_signed: i32) -> Result<Date, CubeError> {
     if months_signed >= 0 {
         add_months(date, months_signed as u32)
     } else {
@@ -424,10 +434,10 @@ fn apply_months(date: NaiveDate, months_signed: i32) -> Result<NaiveDate, CubeEr
 }
 
 fn align_to_origin(
-    start: NaiveDateTime,
+    start: DateTime,
     interval: &SqlInterval,
-    origin: NaiveDateTime,
-) -> Result<NaiveDateTime, CubeError> {
+    origin: DateTime,
+) -> Result<DateTime, CubeError> {
     let mut aligned = start;
     let mut offset = origin;
     // Cap iterations: a net-negative (or net-zero) interval would otherwise
@@ -464,7 +474,7 @@ fn converge_guard(steps: &mut usize) -> Result<(), CubeError> {
     Ok(())
 }
 
-fn format_with_padding(dt: NaiveDateTime, sub_second: &str) -> String {
+fn format_with_padding(dt: DateTime, sub_second: &str) -> String {
     format!(
         "{}T{:02}:{:02}:{:02}.{sub_second}",
         dt.date(),

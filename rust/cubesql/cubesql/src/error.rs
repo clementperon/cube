@@ -504,8 +504,8 @@ impl From<arrow::error::ArrowError> for CubeError {
     }
 }
 
-impl From<chrono::ParseError> for CubeError {
-    fn from(v: chrono::ParseError) -> Self {
+impl From<jiff::Error> for CubeError {
+    fn from(v: jiff::Error) -> Self {
         CubeError::internal(v.to_string())
     }
 }

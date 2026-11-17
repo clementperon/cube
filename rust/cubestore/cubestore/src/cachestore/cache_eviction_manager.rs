@@ -13,10 +13,10 @@ use crate::util::aborting_join_handle::AbortingJoinHandle;
 use crate::util::lock::acquire_lock;
 use crate::util::IntervalLoop;
 use crate::{app_metrics, CubeError};
-use chrono::Utc;
 use datafusion::cube_ext;
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
+use jiff::{SignedDuration, Timestamp};
 use rand::Rng;
 use serde_derive::{Deserialize, Serialize};
 use std::fmt;
@@ -711,7 +711,7 @@ impl CacheEvictionManager {
     ) -> Result<KeysVector, CubeError> {
         let scan = store
             .read_operation_out_of_queue("collect_stats_and_expired_keys", move |db_ref| {
-                let now = Utc::now();
+                let now = Timestamp::now();
                 let cache_schema = CacheItemRocksTable::new(db_ref.clone());
 
                 let mut scan = ExpiredKeysScan {
@@ -774,7 +774,7 @@ impl CacheEvictionManager {
             .read_operation_out_of_queue("collect_allkeys_to_evict", move |db_ref| {
                 let cache_schema = CacheItemRocksTable::new(db_ref.clone());
 
-                let now_at_start = Utc::now();
+                let now_at_start = Timestamp::now();
 
                 let mut scan = AllKeysScan {
                     candidates: Vec::with_capacity(64),
@@ -800,7 +800,7 @@ impl CacheEvictionManager {
                         let ready_to_delete = if ttl <= now_at_start {
                             true
                         } else if ttl - now_at_start
-                            <= chrono::Duration::seconds(eviction_proactive_ttl_threshold as i64)
+                            <= SignedDuration::from_secs(eviction_proactive_ttl_threshold as i64)
                         {
                             // Checking the size of the key, because it can be problematic to delete keys with small size, because
                             // it can be a refresh key.
@@ -918,7 +918,7 @@ impl CacheEvictionManager {
             .read_operation_out_of_queue("do_eviction_by_sampling", move |db_ref| {
                 let mut pending_volume_remove: u64 = 0;
 
-                let now_at_start = Utc::now();
+                let now_at_start = Timestamp::now();
                 let mut to_delete = KeysVector::with_capacity(eviction_batch_size);
 
                 let cache_schema = CacheItemRocksTable::new(db_ref.clone());
@@ -941,7 +941,7 @@ impl CacheEvictionManager {
                         let ready_to_delete = if ttl < now_at_start {
                             true
                         } else if ttl - now_at_start
-                            <= chrono::Duration::seconds(eviction_proactive_ttl_threshold as i64)
+                            <= SignedDuration::from_secs(eviction_proactive_ttl_threshold as i64)
                         {
                             // Checking the size of the key, because it can be problematic to delete keys with small size, because
                             // it can be a refresh key.
@@ -1099,8 +1099,7 @@ impl CacheEvictionManager {
                             let base = match (stored, first_access) {
                                 (Some(stored), Some(first_access)) => {
                                     let elapsed_minutes = stored.lru.map_or(0, |lru| {
-                                        first_access.signed_duration_since(lru).num_minutes().max(0)
-                                            as u32
+                                        first_access.duration_since(lru).as_mins().max(0) as u32
                                     });
                                     lfu_decay_counter(stored.lfu, elapsed_minutes, lfu_decay_time)
                                 }
@@ -1269,10 +1268,7 @@ impl CacheEvictionManager {
                 CacheEvictionWeightCriteria::ByTTL => item.ttl.encode_value_as_u32()?,
                 CacheEvictionWeightCriteria::ByLFU => {
                     let elapsed_minutes = if let Some(lru_dt) = extended.lru {
-                        Utc::now()
-                            .signed_duration_since(lru_dt)
-                            .num_minutes()
-                            .max(0) as u32
+                        Timestamp::now().duration_since(lru_dt).as_mins().max(0) as u32
                     } else {
                         0
                     };

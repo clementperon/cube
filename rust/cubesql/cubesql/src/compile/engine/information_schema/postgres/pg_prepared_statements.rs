@@ -1,4 +1,4 @@
-use std::{any::Any, sync::Arc};
+use std::{any::Any, convert::TryFrom, sync::Arc};
 
 use async_trait::async_trait;
 
@@ -44,7 +44,7 @@ impl PgPreparedStatementsBuilder {
     fn add_prepared_statement(&mut self, name: &str, statement: &PreparedStatement) {
         self.name.append_value(name);
         self.prepare_time
-            .append_value(statement.get_created().timestamp_nanos_opt().unwrap());
+            .append_value(i64::try_from(statement.get_created().as_nanosecond()).unwrap());
 
         if let Some(parameters) = statement.get_parameters() {
             for param in parameters {

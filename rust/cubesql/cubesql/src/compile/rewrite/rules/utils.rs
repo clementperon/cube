@@ -4,7 +4,6 @@ use std::{
     sync::Arc,
 };
 
-use chrono::{DateTime, Datelike, Days, Months, NaiveDate, Timelike, Utc};
 use datafusion::{
     arrow::datatypes::{ArrowPrimitiveType, IntervalDayTimeType, IntervalMonthDayNanoType},
     error::DataFusionError,
@@ -13,10 +12,15 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use egg::Id;
+use jiff::{
+    civil::{Date, DateTime, Weekday},
+    ToSpan,
+};
 
 use crate::{
     compile::rewrite::{rewriter::CubeEGraph, BinaryExprOp, LiteralExprValue, LogicalPlanLanguage},
     transport::SqlTemplates,
+    utils::datetime::datetime_from_unix_seconds,
     CubeError,
 };
 
@@ -459,14 +463,14 @@ pub fn is_literal_date_trunced(ns: i64, granularity: &str) -> Option<bool> {
         return Some(false);
     }
     let seconds = ns / ns_in_seconds;
-    let dt = DateTime::from_timestamp(seconds, 0)?;
+    let dt = datetime_from_unix_seconds(seconds)?;
 
-    let is_minute_trunced = |dt: DateTime<Utc>| dt.second() == 0;
+    let is_minute_trunced = |dt: DateTime| dt.second() == 0;
     let is_hour_trunced = |dt| is_minute_trunced(dt) && dt.minute() == 0;
     let is_day_trunced = |dt| is_hour_trunced(dt) && dt.hour() == 0;
-    let is_week_trunced = |dt| is_day_trunced(dt) && dt.weekday().num_days_from_monday() == 0;
+    let is_week_trunced = |dt| is_day_trunced(dt) && dt.weekday() == Weekday::Monday;
     let is_month_trunced = |dt| is_day_trunced(dt) && dt.day() == 1;
-    let is_quarter_trunced = |dt| is_month_trunced(dt) && dt.month0() % 3 == 0;
+    let is_quarter_trunced = |dt| is_month_trunced(dt) && (dt.month() - 1) % 3 == 0;
     let is_year_trunced = |dt| is_month_trunced(dt) && dt.month() == 1;
 
     Some(match granularity.as_str() {
@@ -752,11 +756,11 @@ impl DecomposedMonthDayNano {
 /// This function calculates the date range for a specific date part (month, quarter, week)
 /// within the given year, constrained by the provided start and end dates.
 pub fn try_merge_range_with_date_part(
-    start_date: NaiveDate,
-    end_date: NaiveDate,
+    start_date: Date,
+    end_date: Date,
     granularity: &str,
     value: i64,
-) -> Option<(NaiveDate, NaiveDate)> {
+) -> Option<(Date, Date)> {
     // Check that the range only covers one year
     let year = start_date.year();
     if year != end_date.year() {
@@ -771,11 +775,9 @@ pub fn try_merge_range_with_date_part(
             }
 
             // Obtain the new range
-            let new_start_date = NaiveDate::from_ymd_opt(year, value as u32, 1)?;
+            let new_start_date = Date::new(year, value as i8, 1).ok()?;
 
-            let new_end_date = new_start_date
-                .checked_add_months(Months::new(1))
-                .and_then(|date| date.checked_sub_days(Days::new(1)))?;
+            let new_end_date = new_start_date.last_of_month();
 
             // If the resulting range is outside of the original range, we can't merge
             // the filters
@@ -800,11 +802,9 @@ pub fn try_merge_range_with_date_part(
             let quarter_start_month = (value - 1) * 3 + 1;
 
             // Obtain the new range
-            let new_start_date = NaiveDate::from_ymd_opt(year, quarter_start_month as u32, 1)?;
+            let new_start_date = Date::new(year, quarter_start_month as i8, 1).ok()?;
 
-            let new_end_date = new_start_date
-                .checked_add_months(Months::new(3))
-                .and_then(|date| date.checked_sub_days(Days::new(1)))?;
+            let new_end_date = new_start_date.checked_add(2.months()).ok()?.last_of_month();
 
             // Paranoid check, If the resulting range is outside of the original range, we can't merge
             // the filters
@@ -832,10 +832,10 @@ pub fn try_merge_range_with_date_part(
             let year = start_date.year();
 
             // Get January 4th of the year (which is always in week 1)
-            let jan_4 = NaiveDate::from_ymd_opt(year, 1, 4)?;
+            let jan_4 = Date::new(year, 1, 4).ok()?;
 
             // Get the Monday of week 1
-            let iso_week = jan_4.iso_week();
+            let iso_week = jan_4.iso_week_date();
             let week_1_year = iso_week.year();
 
             // Check if we're looking at the right ISO year
@@ -849,14 +849,16 @@ pub fn try_merge_range_with_date_part(
             // Calculate the date of Monday of the requested week
             // ISO week 1 starts on the Monday of the week containing January 4th
             let days_from_week_1 = (value - 1) * 7;
-            let week_1_monday = jan_4 - Days::new(jan_4.weekday().num_days_from_monday() as u64);
+            let week_1_monday = jan_4
+                .checked_sub(i64::from(jan_4.weekday().to_monday_zero_offset()).days())
+                .ok()?;
 
-            let week_start = week_1_monday.checked_add_days(Days::new(days_from_week_1 as u64))?;
+            let week_start = week_1_monday.checked_add(days_from_week_1.days()).ok()?;
 
-            let week_end = week_start.checked_add_days(Days::new(6))?;
+            let week_end = week_start.checked_add(6.days()).ok()?;
 
             // Verify this week actually exists in this year (week 53 doesn't always exist)
-            if week_start.iso_week().week() != value as u32 {
+            if i64::from(week_start.iso_week_date().week()) != value {
                 return None;
             }
 
@@ -885,45 +887,27 @@ mod tests {
 
     #[test]
     fn test_calculate_week_range() -> Result<(), CubeError> {
-        let start = NaiveDate::from_ymd_opt(2019, 1, 1).expect("Invalid date");
-        let end = NaiveDate::from_ymd_opt(2019, 12, 31).expect("Invalid date");
+        let start = Date::constant(2019, 1, 1);
+        let end = Date::constant(2019, 12, 31);
 
         // Test week 1 of 2019 (Dec 31, 2018 - Jan 6, 2019)
         // But constrained by our range starting Jan 1
         let (week_start, week_end) =
             try_merge_range_with_date_part(start, end, "week", 1).expect("Expected week range");
-        assert_eq!(
-            week_start,
-            NaiveDate::from_ymd_opt(2019, 1, 1).expect("Invalid date")
-        );
-        assert_eq!(
-            week_end,
-            NaiveDate::from_ymd_opt(2019, 1, 6).expect("Invalid date")
-        );
+        assert_eq!(week_start, Date::constant(2019, 1, 1));
+        assert_eq!(week_end, Date::constant(2019, 1, 6));
 
         // Test week 15 of 2019 (Apr 8-14)
         let (week_start, week_end) =
             try_merge_range_with_date_part(start, end, "week", 15).expect("Expected week range");
-        assert_eq!(
-            week_start,
-            NaiveDate::from_ymd_opt(2019, 4, 8).expect("Invalid date")
-        );
-        assert_eq!(
-            week_end,
-            NaiveDate::from_ymd_opt(2019, 4, 14).expect("Invalid date")
-        );
+        assert_eq!(week_start, Date::constant(2019, 4, 8));
+        assert_eq!(week_end, Date::constant(2019, 4, 14));
 
         // Test week 52 of 2019 (Dec 23-29)
         let (week_start, week_end) =
             try_merge_range_with_date_part(start, end, "week", 52).expect("Expected week range");
-        assert_eq!(
-            week_start,
-            NaiveDate::from_ymd_opt(2019, 12, 23).expect("Invalid date")
-        );
-        assert_eq!(
-            week_end,
-            NaiveDate::from_ymd_opt(2019, 12, 29).expect("Invalid date")
-        );
+        assert_eq!(week_start, Date::constant(2019, 12, 23));
+        assert_eq!(week_end, Date::constant(2019, 12, 29));
 
         // Test invalid week number
         assert_eq!(try_merge_range_with_date_part(start, end, "week", 0), None);
@@ -934,22 +918,16 @@ mod tests {
         assert!(result.is_none());
 
         // Test partial overlap
-        let start = NaiveDate::from_ymd_opt(2019, 4, 10).expect("Invalid date");
-        let end = NaiveDate::from_ymd_opt(2019, 4, 12).expect("Invalid date");
+        let start = Date::constant(2019, 4, 10);
+        let end = Date::constant(2019, 4, 12);
         let (week_start, week_end) =
             try_merge_range_with_date_part(start, end, "week", 15).expect("Expected week range");
-        assert_eq!(
-            week_start,
-            NaiveDate::from_ymd_opt(2019, 4, 10).expect("Invalid date")
-        );
-        assert_eq!(
-            week_end,
-            NaiveDate::from_ymd_opt(2019, 4, 12).expect("Invalid date")
-        );
+        assert_eq!(week_start, Date::constant(2019, 4, 10));
+        assert_eq!(week_end, Date::constant(2019, 4, 12));
 
         // Test no overlap
-        let start = NaiveDate::from_ymd_opt(2019, 5, 1).expect("Invalid date");
-        let end = NaiveDate::from_ymd_opt(2019, 12, 31).expect("Invalid date");
+        let start = Date::constant(2019, 5, 1);
+        let end = Date::constant(2019, 12, 31);
         let result = try_merge_range_with_date_part(start, end, "week", 15);
         assert!(result.is_none());
 

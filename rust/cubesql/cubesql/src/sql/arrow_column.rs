@@ -1,7 +1,6 @@
 //! JSON serialization of Arrow arrays column by column, for `responseFormat: "columnar"`
 //! of `/v1/cubesql`.
 
-use chrono::prelude::*;
 use datafusion::arrow::{
     array::{
         Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array,
@@ -12,12 +11,16 @@ use datafusion::arrow::{
     },
     datatypes::{ArrowPrimitiveType, DataType, IntervalUnit, TimeUnit},
 };
+use jiff::civil::Date;
 use serde::{Serialize, Serializer};
 use std::fmt;
 
 use super::dataframe::{
     interval_day_time_value, interval_month_day_nano_value, interval_year_month_value,
     Decimal128Value, ListValue, TableValue,
+};
+use crate::utils::datetime::{
+    date_from_unix_days, datetime_from_unix_millis, datetime_from_unix_nanos,
 };
 
 /// Serializes an Arrow array as a JSON array straight from its buffers, with the
@@ -173,7 +176,7 @@ impl Serialize for TimestampCell<'_> {
         let (cached_day, mut date) = self.date.get();
         if cached_day != day {
             // Not from `day * NANOS_PER_DAY`: that overflows for the earliest day.
-            let ndt = Utc.timestamp_nanos(nanos);
+            let ndt = datetime_from_unix_nanos(nanos);
             // i64 nanoseconds span 1677..=2262, so the year is always 4 digits.
             put(&mut date[0..4], ndt.year() as u64);
             date[4] = b'-';
@@ -193,6 +196,19 @@ impl Serialize for TimestampCell<'_> {
 
         // Only ASCII digits and separators.
         serializer.serialize_str(std::str::from_utf8(&out).unwrap())
+    }
+}
+
+/// A date as `TableValue::Date` writes it. `None` is a value outside the dates a `Date` holds,
+/// which fails the serialization.
+struct DateCell(Option<Date>);
+
+impl Serialize for DateCell {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            Some(date) => TableValue::Date(date).serialize(serializer),
+            None => Err(serde::ser::Error::custom("date is out of range")),
+        }
     }
 }
 
@@ -237,16 +253,10 @@ impl Serialize for ArrowColumn<'_> {
                 serializer.collect_seq(array.as_any().downcast_ref::<StringArray>().unwrap().iter())
             }
             DataType::Date32 => serialize_column!(serializer, array, Date32Array, |a, i| {
-                TableValue::Date(
-                    a.value_as_date(i)
-                        .expect("value_as_date must return Option with NaiveDate for Date32Array"),
-                )
+                DateCell(date_from_unix_days(a.value(i)))
             }),
             DataType::Date64 => serialize_column!(serializer, array, Date64Array, |a, i| {
-                TableValue::Date(
-                    a.value_as_date(i)
-                        .expect("value_as_date must return Option with NaiveDate for Date64Array"),
-                )
+                DateCell(datetime_from_unix_millis(a.value(i)).map(|datetime| datetime.date()))
             }),
             DataType::Timestamp(TimeUnit::Millisecond, _) => TimestampColumn {
                 array: array

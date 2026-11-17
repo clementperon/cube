@@ -6,9 +6,13 @@ use crate::{
 };
 use byteorder::{BigEndian, ByteOrder};
 use bytes::{BufMut, BytesMut};
-use chrono::prelude::*;
-use chrono_tz::Tz;
+use jiff::{
+    civil::{Date, DateTime, Time},
+    tz::{Offset, TimeZone},
+    Timestamp, ZonedDateTime,
+};
 use std::backtrace::Backtrace;
+use std::convert::TryFrom;
 use std::io::Error;
 use std::{
     fmt::{self, Debug, Display, Formatter},
@@ -29,22 +33,26 @@ impl TimestampValue {
         TimestampValue { unix_nano, tz }
     }
 
-    pub fn to_naive_datetime(&self) -> NaiveDateTime {
-        // Not `from_timestamp(nanos / 1e9, nanos % 1e9)`: the truncating `%` is negative for
-        // pre-epoch values with a fractional second, and `from_timestamp` rejects it.
-        Utc.timestamp_nanos(self.unix_nano).naive_utc()
+    fn to_timestamp(&self) -> Timestamp {
+        Timestamp::from_nanosecond(i128::from(self.unix_nano))
+            .expect("every i64 nanosecond count (years 1677..=2262) is a valid Timestamp")
     }
 
-    pub fn to_fixed_datetime(&self) -> io::Result<DateTime<Tz>> {
+    /// The civil (wall clock) date and time of this timestamp in UTC.
+    pub fn to_naive_datetime(&self) -> DateTime {
+        Offset::UTC.to_datetime(self.to_timestamp())
+    }
+
+    pub fn to_fixed_datetime(&self) -> io::Result<ZonedDateTime> {
         assert!(self.tz.is_some());
-        let tz = self
-            .tz
-            .as_ref()
-            .unwrap()
-            .parse::<Tz>()
-            .map_err(|err| io::Error::other(err.to_string()))?;
-        let ndt = self.to_naive_datetime();
-        Ok(tz.from_utc_datetime(&ndt))
+        let name = self.tz.as_ref().unwrap();
+        // UTC is what nearly every value carries, and needs no time zone database lookup.
+        let tz = if name == "UTC" {
+            TimeZone::UTC
+        } else {
+            TimeZone::get(name).map_err(|err| io::Error::other(err.to_string()))?
+        };
+        Ok(self.to_timestamp().to_zoned_datetime(tz))
     }
 
     pub fn tz_ref(&self) -> &Option<String> {
@@ -80,23 +88,24 @@ fn put_padded(buf: &mut impl BufMut, mut value: u32, width: usize) {
 }
 
 /// Writes `YYYY-MM-DD<sep>HH:MM:SS.<fraction>`, truncating the fraction to `frac_digits` like
-/// chrono's `%.6f`. `i64` nanoseconds only span years 1677..=2262, so the year is always 4 digits.
-fn put_timestamp(buf: &mut impl BufMut, ndt: &NaiveDateTime, sep: u8, frac_digits: usize) {
+/// strftime's `%.6f`. `i64` nanoseconds only span years 1677..=2262, so the year is always
+/// 4 digits.
+fn put_timestamp(buf: &mut impl BufMut, ndt: &DateTime, sep: u8, frac_digits: usize) {
     put_padded(buf, ndt.year() as u32, 4);
     buf.put_u8(b'-');
-    put_padded(buf, ndt.month(), 2);
+    put_padded(buf, ndt.month() as u32, 2);
     buf.put_u8(b'-');
-    put_padded(buf, ndt.day(), 2);
+    put_padded(buf, ndt.day() as u32, 2);
     buf.put_u8(sep);
-    put_padded(buf, ndt.hour(), 2);
+    put_padded(buf, ndt.hour() as u32, 2);
     buf.put_u8(b':');
-    put_padded(buf, ndt.minute(), 2);
+    put_padded(buf, ndt.minute() as u32, 2);
     buf.put_u8(b':');
-    put_padded(buf, ndt.second(), 2);
+    put_padded(buf, ndt.second() as u32, 2);
     buf.put_u8(b'.');
     put_padded(
         buf,
-        ndt.nanosecond() / 10u32.pow(9 - frac_digits as u32),
+        ndt.subsec_nanosecond() as u32 / 10u32.pow(9 - frac_digits as u32),
         frac_digits,
     );
 }
@@ -116,18 +125,18 @@ impl Display for TimestampValue {
 
 // POSTGRES_EPOCH_JDATE
 // https://github.com/postgres/postgres/blob/REL_14_4/src/include/datatype/timestamp.h#L163
-pub(crate) fn pg_base_date_epoch() -> NaiveDateTime {
-    NaiveDate::from_ymd_opt(2000, 1, 1)
-        .unwrap()
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
+pub(crate) fn pg_base_date_epoch() -> DateTime {
+    DateTime::constant(2000, 1, 1, 0, 0, 0, 0)
 }
+
+/// [`pg_base_date_epoch`] as nanoseconds since the Unix epoch.
+const PG_BASE_DATE_EPOCH_UNIX_NANOS: i64 = 946_684_800_000_000_000;
 
 impl ToProtocolValue for TimestampValue {
     fn to_text(&self, buf: &mut BytesMut) -> Result<(), ProtocolError> {
         let ndt = match self.tz_ref() {
             None => self.to_naive_datetime(),
-            Some(_) => self.to_fixed_datetime()?.naive_utc(),
+            Some(_) => Offset::UTC.to_datetime(self.to_fixed_datetime()?.timestamp()),
         };
 
         // 2022-04-25 15:36:49.397050+00
@@ -149,15 +158,11 @@ impl ToProtocolValue for TimestampValue {
     fn to_binary(&self, buf: &mut BytesMut) -> Result<(), ProtocolError> {
         let ndt = match self.tz_ref() {
             None => self.to_naive_datetime(),
-            Some(_) => self.to_fixed_datetime()?.naive_utc(),
+            Some(_) => Offset::UTC.to_datetime(self.to_fixed_datetime()?.timestamp()),
         };
 
-        let n = ndt
-            .signed_duration_since(pg_base_date_epoch())
-            .num_microseconds()
-            .ok_or(Error::other(
-                "Unable to extract number of seconds from timestamp",
-            ))?;
+        let n = i64::try_from(ndt.duration_since(pg_base_date_epoch()).as_micros())
+            .map_err(|_| Error::other("Unable to extract number of seconds from timestamp"))?;
 
         buf.put_i32(8);
         buf.put_i64(n);
@@ -175,17 +180,14 @@ impl FromProtocolValue for TimestampValue {
 
         // Parse timestamp string in format "YYYY-MM-DD HH:MM:SS[.fff]", but PostgreSQL supports
         // more formats, so let's align this with parse_date_str function from cubesql crate.
-        let parsed_datetime = NaiveDateTime::parse_from_str(as_str, "%Y-%m-%d %H:%M:%S")
-            .or_else(|_| NaiveDateTime::parse_from_str(as_str, "%Y-%m-%d %H:%M:%S%.f"))
-            .or_else(|_| NaiveDateTime::parse_from_str(as_str, "%Y-%m-%d %H:%M:%S%.f UTC"))
-            .or_else(|_| NaiveDateTime::parse_from_str(as_str, "%Y-%m-%dT%H:%M:%S"))
-            .or_else(|_| NaiveDateTime::parse_from_str(as_str, "%Y-%m-%dT%H:%M:%S%.f"))
-            .or_else(|_| NaiveDateTime::parse_from_str(as_str, "%Y-%m-%dT%H:%M:%S%.fZ"))
+        let parsed_datetime = DateTime::strptime("%Y-%m-%d %H:%M:%S", as_str)
+            .or_else(|_| DateTime::strptime("%Y-%m-%d %H:%M:%S%.f", as_str))
+            .or_else(|_| DateTime::strptime("%Y-%m-%d %H:%M:%S%.f UTC", as_str))
+            .or_else(|_| DateTime::strptime("%Y-%m-%dT%H:%M:%S", as_str))
+            .or_else(|_| DateTime::strptime("%Y-%m-%dT%H:%M:%S%.f", as_str))
+            .or_else(|_| DateTime::strptime("%Y-%m-%dT%H:%M:%S%.fZ", as_str))
             .or_else(|_| {
-                NaiveDate::parse_from_str(as_str, "%Y-%m-%d").map(|date| {
-                    date.and_hms_opt(0, 0, 0)
-                        .expect("Unable to set time to 00:00:00")
-                })
+                Date::strptime("%Y-%m-%d", as_str).map(|date| date.to_datetime(Time::midnight()))
             })
             .map_err(|err| ProtocolError::ErrorResponse {
                 source: ErrorResponse::error(
@@ -199,9 +201,10 @@ impl FromProtocolValue for TimestampValue {
             })?;
 
         // Convert to Unix nanoseconds
-        let unix_nano = parsed_datetime
-            .and_utc()
-            .timestamp_nanos_opt()
+        let unix_nano = Offset::UTC
+            .to_timestamp(parsed_datetime)
+            .ok()
+            .and_then(|timestamp| i64::try_from(timestamp.as_nanosecond()).ok())
             .ok_or_else(|| ProtocolError::ErrorResponse {
                 source: ErrorResponse::error(
                     ErrorCode::ProtocolViolation,
@@ -233,13 +236,7 @@ impl FromProtocolValue for TimestampValue {
         // Convert PostgreSQL microseconds to Unix nanoseconds
         let unix_nano = pg_microseconds
             .checked_mul(1_000)
-            .and_then(|nanos| {
-                pg_base_date_epoch()
-                    .and_utc()
-                    .timestamp_nanos_opt()
-                    .expect("Unable to get timestamp nanos for pg_base_date_epoch")
-                    .checked_add(nanos)
-            })
+            .and_then(|nanos| PG_BASE_DATE_EPOCH_UNIX_NANOS.checked_add(nanos))
             .ok_or_else(|| ProtocolError::ErrorResponse {
                 source: ErrorResponse::error(
                     ErrorCode::ProtocolViolation,
@@ -366,13 +363,13 @@ mod tests {
     fn test_timestamp_from_text_various_formats() {
         // Test basic format without fractional seconds
         let ts1 = TimestampValue::from_text(b"2025-08-04 20:15:47").unwrap();
-        assert_eq!(ts1.to_naive_datetime().to_string(), "2025-08-04 20:15:47");
+        assert_eq!(ts1.to_naive_datetime().to_string(), "2025-08-04T20:15:47");
 
         // Test PostgreSQL format with 6-digit fractional seconds
         let ts2 = TimestampValue::from_text(b"2025-08-04 20:16:54.853660").unwrap();
         assert_eq!(
             ts2.to_naive_datetime()
-                .format("%Y-%m-%d %H:%M:%S%.6f")
+                .strftime("%Y-%m-%d %H:%M:%S%.6f")
                 .to_string(),
             "2025-08-04 20:16:54.853660"
         );
@@ -381,20 +378,20 @@ mod tests {
         let ts3 = TimestampValue::from_text(b"2025-08-04 20:15:47.953").unwrap();
         assert_eq!(
             ts3.to_naive_datetime()
-                .format("%Y-%m-%d %H:%M:%S%.3f")
+                .strftime("%Y-%m-%d %H:%M:%S%.3f")
                 .to_string(),
             "2025-08-04 20:15:47.953"
         );
 
         // Test ISO format with T separator
         let ts4 = TimestampValue::from_text(b"2025-08-04T20:15:47").unwrap();
-        assert_eq!(ts4.to_naive_datetime().to_string(), "2025-08-04 20:15:47");
+        assert_eq!(ts4.to_naive_datetime().to_string(), "2025-08-04T20:15:47");
 
         // Test ISO format with T separator and fractional seconds
         let ts5 = TimestampValue::from_text(b"2025-08-04T20:15:47.953116").unwrap();
         assert_eq!(
             ts5.to_naive_datetime()
-                .format("%Y-%m-%d %H:%M:%S%.6f")
+                .strftime("%Y-%m-%d %H:%M:%S%.6f")
                 .to_string(),
             "2025-08-04 20:15:47.953116"
         );

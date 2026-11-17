@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use bytes::BufMut;
 use tokio::io::AsyncReadExt;
 
-#[cfg(feature = "with-chrono")]
+#[cfg(feature = "with-jiff")]
 use crate::TimestampValue;
 use crate::{buffer, BindValue, FromProtocolValue, PgType, PgTypeId, ProtocolError};
 
@@ -897,14 +897,14 @@ impl Bind {
                     PgTypeId::FLOAT8 => {
                         BindValue::Float64(f64::from_protocol(raw_value, param_format)?)
                     }
-                    #[cfg(feature = "with-chrono")]
+                    #[cfg(feature = "with-jiff")]
                     PgTypeId::TIMESTAMP => BindValue::Timestamp(TimestampValue::from_protocol(
                         raw_value,
                         param_format,
                     )?),
-                    #[cfg(feature = "with-chrono")]
+                    #[cfg(feature = "with-jiff")]
                     PgTypeId::DATE => {
-                        BindValue::Date(chrono::NaiveDate::from_protocol(raw_value, param_format)?)
+                        BindValue::Date(jiff::civil::Date::from_protocol(raw_value, param_format)?)
                     }
                     _ => {
                         return Err(ErrorResponse::error(
@@ -1603,10 +1603,10 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "with-chrono")]
+    #[cfg(feature = "with-jiff")]
     #[tokio::test]
     async fn test_frontend_message_parse_bind_date() -> Result<(), ProtocolError> {
-        use chrono::NaiveDate;
+        use jiff::civil::Date;
 
         // Test text format date "2025-08-08"
         let buffer = parse_hex_dump(
@@ -1628,9 +1628,7 @@ mod tests {
             FrontendMessage::Bind(body) => {
                 assert_eq!(
                     body.to_bind_values(&ParameterDescription::new(vec![PgTypeId::DATE]))?,
-                    vec![BindValue::Date(
-                        NaiveDate::from_ymd_opt(2025, 8, 8).unwrap()
-                    )]
+                    vec![BindValue::Date(Date::constant(2025, 8, 8))]
                 );
             }
             _ => panic!("Wrong message, must be Bind"),
@@ -1656,9 +1654,7 @@ mod tests {
                 assert_eq!(body.parameter_formats, vec![Format::Binary]);
                 assert_eq!(
                     body.to_bind_values(&ParameterDescription::new(vec![PgTypeId::DATE]))?,
-                    vec![BindValue::Date(
-                        NaiveDate::from_ymd_opt(2025, 8, 8).unwrap()
-                    )]
+                    vec![BindValue::Date(Date::constant(2025, 8, 8))]
                 );
             }
             _ => panic!("Wrong message, must be Bind"),

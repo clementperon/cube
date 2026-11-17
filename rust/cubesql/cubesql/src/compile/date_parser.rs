@@ -1,12 +1,12 @@
 use crate::compile::engine::df::scan::DataFusionError;
-use chrono::{NaiveDate, NaiveDateTime};
+use jiff::civil::{Date, DateTime, Time};
 
-pub fn parse_date_str(s: &str) -> Result<NaiveDateTime, DataFusionError> {
+pub fn parse_date_str(s: &str) -> Result<DateTime, DataFusionError> {
     if let Some(parsed) = parse_fast(s) {
         return Ok(parsed);
     }
 
-    parse_with_chrono(s).map_err(|e| {
+    parse_with_strptime(s).map_err(|e| {
         DataFusionError::Internal(format!(
             "Can't parse date/time string literal {:?}: {}",
             s, e
@@ -37,7 +37,7 @@ fn ascii_u32_4(b: &[u8], at: usize) -> Option<u32> {
 }
 
 /// Recognizes only `YYYY-MM-DDTHH:MM:SS.fff` (23 bytes, `T` separator, 3-digit fraction).
-fn parse_fast(s: &str) -> Option<NaiveDateTime> {
+fn parse_fast(s: &str) -> Option<DateTime> {
     let b = s.as_bytes();
     if b.len() != 23
         || b[4] != b'-'
@@ -50,48 +50,49 @@ fn parse_fast(s: &str) -> Option<NaiveDateTime> {
         return None;
     }
 
-    let year = ascii_u32_4(b, 0)? as i32;
-    let month = ascii_u32_2(b, 5)?;
-    let day = ascii_u32_2(b, 8)?;
-    let hour = ascii_u32_2(b, 11)?;
-    let minute = ascii_u32_2(b, 14)?;
-    let second = ascii_u32_2(b, 17)?;
+    // Every value is at most four (year) or two (the rest) decimal digits, so the casts are
+    // lossless; the constructor rejects anything that is not a real date or time.
+    let year = ascii_u32_4(b, 0)? as i16;
+    let month = ascii_u32_2(b, 5)? as i8;
+    let day = ascii_u32_2(b, 8)? as i8;
+    let hour = ascii_u32_2(b, 11)? as i8;
+    let minute = ascii_u32_2(b, 14)? as i8;
+    let second = ascii_u32_2(b, 17)? as i8;
     let frac_millis = digit(b[20])? * 100 + digit(b[21])? * 10 + digit(b[22])?;
 
-    NaiveDate::from_ymd_opt(year, month, day)?.and_hms_nano_opt(
+    DateTime::new(
+        year,
+        month,
+        day,
         hour,
         minute,
         second,
-        frac_millis * 1_000_000,
+        frac_millis as i32 * 1_000_000,
     )
+    .ok()
 }
 
-fn parse_with_chrono(s: &str) -> chrono::ParseResult<NaiveDateTime> {
-    NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
-        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f"))
-        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
-        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
-        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.fZ"))
-        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f UTC"))
-        .or_else(|_| {
-            NaiveDate::parse_from_str(s, "%Y-%m-%d").map(|date| date.and_hms_opt(0, 0, 0).unwrap())
-        })
+fn parse_with_strptime(s: &str) -> Result<DateTime, jiff::Error> {
+    DateTime::strptime("%Y-%m-%dT%H:%M:%S%.f", s)
+        .or_else(|_| DateTime::strptime("%Y-%m-%d %H:%M:%S%.f", s))
+        .or_else(|_| DateTime::strptime("%Y-%m-%dT%H:%M:%S", s))
+        .or_else(|_| DateTime::strptime("%Y-%m-%d %H:%M:%S", s))
+        .or_else(|_| DateTime::strptime("%Y-%m-%dT%H:%M:%S%.fZ", s))
+        .or_else(|_| DateTime::strptime("%Y-%m-%d %H:%M:%S%.f UTC", s))
+        .or_else(|_| Date::strptime("%Y-%m-%d", s).map(|date| date.to_datetime(Time::midnight())))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ymd_hmsn(y: i32, m: u32, d: u32, h: u32, mi: u32, s: u32, n: u32) -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(y, m, d)
-            .unwrap()
-            .and_hms_nano_opt(h, mi, s, n)
-            .unwrap()
+    fn ymd_hmsn(y: i16, m: i8, d: i8, h: i8, mi: i8, s: i8, n: i32) -> DateTime {
+        DateTime::constant(y, m, d, h, mi, s, n)
     }
 
     #[test]
     fn fast_path_accepts_canonical_shape() {
-        let cases: &[(&str, NaiveDateTime)] = &[
+        let cases: &[(&str, DateTime)] = &[
             ("2022-01-01T00:00:00.000", ymd_hmsn(2022, 1, 1, 0, 0, 0, 0)),
             (
                 "2024-06-15T13:45:07.123",
@@ -139,8 +140,8 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_handles_other_shapes_via_chrono_fallback() {
-        let cases: &[(&str, NaiveDateTime)] = &[
+    fn wrapper_handles_other_shapes_via_strptime_fallback() {
+        let cases: &[(&str, DateTime)] = &[
             ("2022-01-01", ymd_hmsn(2022, 1, 1, 0, 0, 0, 0)),
             ("2022-01-01 00:00:00", ymd_hmsn(2022, 1, 1, 0, 0, 0, 0)),
             ("2022-01-01T00:00:00", ymd_hmsn(2022, 1, 1, 0, 0, 0, 0)),

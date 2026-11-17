@@ -5,12 +5,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
-use chrono::format::Fixed::Nanosecond3;
-use chrono::format::Item::{Fixed, Literal, Numeric, Space};
-use chrono::format::Numeric::{Day, Hour, Minute, Month, Second, Year};
-use chrono::format::Pad::Zero;
-use chrono::format::Parsed;
-use chrono::{ParseResult, TimeZone, Utc};
 use datafusion::arrow::array::*;
 use datafusion::arrow::compute::kernels::cast_utils::string_to_timestamp_nanos;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -23,6 +17,7 @@ use futures::stream::BoxStream;
 use futures::TryStreamExt;
 use hex::FromHex;
 use itertools::Itertools;
+use jiff::tz::Offset;
 use log::trace;
 use rand::distributions::Uniform;
 use rand::{thread_rng, Rng};
@@ -51,7 +46,6 @@ use crate::metastore::{
     is_valid_plain_binary_hll, HllFlavour, IdRow, ImportFormat, Index, IndexDef, IndexType,
     MetaStoreTable, Schema,
 };
-use crate::queryplanner::info_schema::timestamp_nanos_or_panic;
 use crate::queryplanner::panic::PanicWorkerNode;
 use crate::queryplanner::pretty_printers::{pp_phys_plan, pp_plan};
 use crate::queryplanner::query_executor::{
@@ -66,6 +60,7 @@ use crate::store::ChunkDataStore;
 use crate::table::{data, Row, TableValue, TimestampValue};
 use crate::util::decimal::{Decimal, Decimal96};
 use crate::util::strings::path_to_string;
+use crate::util::time::timestamp_from_unix_nanos;
 use crate::CubeError;
 use crate::{
     app_metrics,
@@ -1033,7 +1028,7 @@ impl SqlService for SqlServiceImpl {
                     .map_or(Result::Ok(None), |(_, value)| match value {
                         Expr::Value(Value::SingleQuotedString(build_range_end)) => {
                             let ts = timestamp_from_string(build_range_end.as_str())?;
-                            let utc = Utc.timestamp_nanos(ts.get_time_stamp());
+                            let utc = timestamp_from_unix_nanos(ts.get_time_stamp());
                             Result::Ok(Some(utc))
                         }
                         _ => Result::Err(CubeError::user(format!("Bad build_range_end {}", value))),
@@ -1046,7 +1041,7 @@ impl SqlService for SqlServiceImpl {
                     .map_or(Result::Ok(None), |(_, value)| match value {
                         Expr::Value(Value::SingleQuotedString(seal_at)) => {
                             let ts = timestamp_from_string(seal_at)?;
-                            let utc = Utc.timestamp_nanos(ts.get_time_stamp());
+                            let utc = timestamp_from_unix_nanos(ts.get_time_stamp());
                             Result::Ok(Some(utc))
                         }
                         _ => Result::Err(CubeError::user(format!("Bad seal_at {}", value))),
@@ -1841,11 +1836,9 @@ pub fn timestamp_from_string(v: &str) -> Result<TimestampValue, CubeError> {
     let nanos;
     if v.ends_with("UTC") {
         // TODO this parsed as nanoseconds instead of milliseconds
-        #[rustfmt::skip] // built from "%Y-%m-%d %H:%M:%S%.3f UTC".
-        const FORMAT: [chrono::format::Item; 14] = [Numeric(Year, Zero), Literal("-"), Numeric(Month, Zero), Literal("-"), Numeric(Day, Zero), Space(" "), Numeric(Hour, Zero), Literal(":"), Numeric(Minute, Zero), Literal(":"), Numeric(Second, Zero), Fixed(Nanosecond3), Space(" "), Literal("UTC")];
-        match parse_time(v, &FORMAT).and_then(|p| p.to_datetime_with_timezone(&Utc)) {
-            Ok(ts) => nanos = timestamp_nanos_or_panic(&ts),
-            Err(_) => return Err(CubeError::user(format!("Can't parse timestamp: {}", v))),
+        match parse_utc_suffixed_timestamp_nanos(v) {
+            Some(ts) => nanos = ts,
+            None => return Err(CubeError::user(format!("Can't parse timestamp: {}", v))),
         }
     } else {
         match string_to_timestamp_nanos(v) {
@@ -1856,10 +1849,15 @@ pub fn timestamp_from_string(v: &str) -> Result<TimestampValue, CubeError> {
     Ok(TimestampValue::new(nanos))
 }
 
-fn parse_time(s: &str, format: &[chrono::format::Item]) -> ParseResult<Parsed> {
-    let mut p = Parsed::new();
-    chrono::format::parse(&mut p, s, format.into_iter())?;
-    Ok(p)
+/// Parses `2021-01-01 00:00:00.123 UTC` into nanoseconds since the Unix epoch. The fraction is
+/// optional and may have up to 9 digits. `None` if the string does not match or the instant
+/// does not fit `i64` nanoseconds.
+fn parse_utc_suffixed_timestamp_nanos(s: &str) -> Option<i64> {
+    let date_time = jiff::fmt::strtime::parse("%Y-%m-%d %H:%M:%S%.f UTC", s)
+        .and_then(|parsed| parsed.to_datetime())
+        .ok()?;
+    let timestamp = Offset::UTC.to_timestamp(date_time).ok()?;
+    i64::try_from(timestamp.as_nanosecond()).ok()
 }
 
 fn parse_float(cell: &Expr) -> Result<f64, CubeError> {
@@ -1964,7 +1962,57 @@ mod tests {
     use crate::scheduler::SchedulerImpl;
     use crate::table::data::{cmp_min_rows, cmp_row_key_heap};
     use crate::table::TableValue;
+    use crate::util::time::to_utc_string;
     use regex::Regex;
+
+    #[test]
+    fn timestamp_from_string_with_utc_suffix() {
+        let nanos = |s: &str| timestamp_from_string(s).map(|ts| ts.get_time_stamp());
+
+        assert_eq!(
+            nanos("2021-01-01 00:00:00 UTC").unwrap(),
+            1_609_459_200_000_000_000
+        );
+        // The fraction is optional and holds up to 9 digits, stored with microsecond precision.
+        assert_eq!(
+            nanos("2021-01-01 00:00:00.5 UTC").unwrap(),
+            1_609_459_200_500_000_000
+        );
+        assert_eq!(
+            nanos("2021-01-01 00:00:00.123 UTC").unwrap(),
+            1_609_459_200_123_000_000
+        );
+        assert_eq!(
+            nanos("2021-01-01 00:00:00.123456789 UTC").unwrap(),
+            1_609_459_200_123_456_000
+        );
+        assert_eq!(nanos("1969-12-31 23:59:59.999 UTC").unwrap(), -1_000_000);
+        // Unpadded numbers and loose whitespace are accepted.
+        assert_eq!(
+            nanos("2021-1-1 0:0:0 UTC").unwrap(),
+            1_609_459_200_000_000_000
+        );
+        assert_eq!(
+            nanos("2021-01-01  00:00:00.123UTC").unwrap(),
+            1_609_459_200_123_000_000
+        );
+
+        for invalid in [
+            "2021-01-01T00:00:00 UTC",
+            "2021-01-01 00:00 UTC",
+            "2021-01-01 UTC",
+            "2021-02-30 00:00:00 UTC",
+            "2021-01-01 24:00:00 UTC",
+            "2021-01-01 00:00:00. UTC",
+            "2021-01-01 00:00:00 +0000 UTC",
+            "10000-01-01 00:00:00 UTC",
+            // Do not fit nanoseconds in an i64.
+            "1600-01-01 00:00:00 UTC",
+            "2300-01-01 00:00:00 UTC",
+        ] {
+            assert!(nanos(invalid).is_err(), "{} must not parse", invalid);
+        }
+    }
 
     /// Reads `(precision, scale, bitWidth)` of a decimal field from the schema
     /// message (the first encapsulated message of an Arrow IPC stream).
@@ -2293,7 +2341,7 @@ mod tests {
                 TableValue::String("NULL".to_string()),
                 TableValue::String("false".to_string()),
                 TableValue::String("true".to_string()),
-                TableValue::String(meta_store.get_table("Foo".to_string(), "Persons".to_string()).await?.get_row().created_at().as_ref().unwrap().to_string()),
+                TableValue::String(to_utc_string(meta_store.get_table("Foo".to_string(), "Persons".to_string()).await?.get_row().created_at().unwrap())),
                 TableValue::String("NULL".to_string()),
                 TableValue::String("NULL".to_string()),
                 TableValue::String("false".to_string()),
@@ -2413,7 +2461,7 @@ mod tests {
                 TableValue::String("NULL".to_string()),
                 TableValue::String("false".to_string()),
                 TableValue::String("true".to_string()),
-                TableValue::String(meta_store.get_table("Foo".to_string(), "Persons".to_string()).await?.get_row().created_at().as_ref().unwrap().to_string()),
+                TableValue::String(to_utc_string(meta_store.get_table("Foo".to_string(), "Persons".to_string()).await?.get_row().created_at().unwrap())),
                 TableValue::String("NULL".to_string()),
                 TableValue::String("2022-10-05 01:00:00 UTC".to_string()),
                 TableValue::String("false".to_string()),

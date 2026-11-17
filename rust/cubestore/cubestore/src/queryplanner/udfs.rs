@@ -1,8 +1,8 @@
 use crate::queryplanner::hll::{Hll, HllUnion};
 use crate::queryplanner::info_schema::timestamp_nanos_or_panic;
 use crate::queryplanner::udf_xirr::{XirrUDF, XIRR_UDAF_NAME};
+use crate::util::time::timestamp_from_unix_nanos;
 use crate::CubeError;
-use chrono::{DateTime, Datelike, Duration, Months, NaiveDateTime};
 use datafusion::arrow::array::{
     Array, ArrayRef, BinaryArray, StringArray, TimestampNanosecondArray, UInt64Builder,
 };
@@ -17,6 +17,9 @@ use datafusion::logical_expr::{
 };
 use datafusion::physical_plan::{Accumulator, ColumnarValue};
 use datafusion::scalar::ScalarValue;
+use jiff::civil::DateTime;
+use jiff::tz::Offset;
+use jiff::{SignedDuration, Span};
 use serde_derive::{Deserialize, Serialize};
 use std::any::Any;
 use std::sync::Arc;
@@ -210,12 +213,18 @@ impl ScalarUDFImpl for UnixTimestamp {
     }
 }
 
-fn interval_dt_duration(interval_days: i32, interval_nanos: i64) -> Duration {
-    Duration::days(interval_days as i64) + Duration::nanoseconds(interval_nanos)
+fn interval_dt_duration(interval_days: i32, interval_nanos: i64) -> SignedDuration {
+    SignedDuration::from_hours(24 * interval_days as i64)
+        + SignedDuration::from_nanos(interval_nanos)
 }
 
-fn calc_intervals(start: NaiveDateTime, end: NaiveDateTime, interval: i32) -> i32 {
-    let years_diff = end.year() - start.year();
+/// `None` when the duration does not fit `i64` nanoseconds.
+fn duration_nanos(duration: SignedDuration) -> Option<i64> {
+    i64::try_from(duration.as_nanos()).ok()
+}
+
+fn calc_intervals(start: DateTime, end: DateTime, interval: i32) -> i32 {
+    let years_diff = end.year() as i32 - start.year() as i32;
     let months_diff = end.month() as i32 - start.month() as i32;
     let mut total_months = years_diff * 12 + months_diff;
 
@@ -234,56 +243,50 @@ fn calc_intervals(start: NaiveDateTime, end: NaiveDateTime, interval: i32) -> i3
 }
 
 /// Calculate date_bin timestamp for source date for year-month interval
-fn calc_bin_timestamp_ym(origin: NaiveDateTime, source: &i64, interval: i32) -> NaiveDateTime {
-    let timestamp = naive_datetime_from_timestamp_or_panic(
-        *source / 1_000_000_000,
-        (*source % 1_000_000_000) as u32,
-    );
+fn calc_bin_timestamp_ym(origin: DateTime, source: &i64, interval: i32) -> DateTime {
+    let timestamp = utc_datetime_from_unix_nanos(*source);
     let num_intervals = calc_intervals(origin, timestamp, interval);
-    let nearest_date = if num_intervals >= 0 {
-        origin
-            .date()
-            .checked_add_months(Months::new((num_intervals * interval) as u32))
-            .unwrap_or(origin.date())
-    } else {
-        origin
-            .date()
-            .checked_sub_months(Months::new((-num_intervals * interval) as u32))
-            .unwrap_or(origin.date())
-    };
+    // Adding months clamps to the last day of the month, e.g. Jan 31 + 1 month = Feb 28/29.
+    let nearest_date = Span::new()
+        .try_months(num_intervals as i64 * interval as i64)
+        .and_then(|months| origin.date().checked_add(months))
+        .unwrap_or(origin.date());
 
-    NaiveDateTime::new(nearest_date, origin.time())
+    nearest_date.to_datetime(origin.time())
+}
+
+/// The UTC wall clock time of a `TimestampNanosecond` value.
+fn utc_datetime_from_unix_nanos(unix_nanos: i64) -> DateTime {
+    Offset::UTC.to_datetime(timestamp_from_unix_nanos(unix_nanos))
 }
 
 // TODO upgrade DF: Pass up error, don't panic (even if the panic should be super rare)
-pub fn naive_datetime_from_timestamp_or_panic(secs: i64, nsecs: u32) -> NaiveDateTime {
-    DateTime::from_timestamp(secs, nsecs)
-        .expect("invalid or out-of-range datetime")
-        .naive_utc()
+fn unix_nanos_from_utc_datetime_or_panic(date_time: DateTime) -> i64 {
+    let timestamp = Offset::UTC
+        .to_timestamp(date_time)
+        .expect("value can not be represented in a timestamp with nanosecond precision.");
+    timestamp_nanos_or_panic(&timestamp)
 }
 
 /// Calculate date_bin timestamp for source date for date-time interval
 fn calc_bin_timestamp_dt(
-    origin: NaiveDateTime,
+    origin: DateTime,
     source: &i64,
     interval_days: i32,
     interval_nanos: i64,
-) -> NaiveDateTime {
-    let timestamp = naive_datetime_from_timestamp_or_panic(
-        *source / 1_000_000_000,
-        (*source % 1_000_000_000) as u32,
-    );
-    let diff = timestamp - origin;
+) -> DateTime {
+    let timestamp = utc_datetime_from_unix_nanos(*source);
+    let diff = timestamp.duration_since(origin);
     let interval_duration = interval_dt_duration(interval_days, interval_nanos);
     let num_intervals =
-        diff.num_nanoseconds().unwrap_or(0) / interval_duration.num_nanoseconds().unwrap_or(1);
+        duration_nanos(diff).unwrap_or(0) / duration_nanos(interval_duration).unwrap_or(1);
     let mut nearest_timestamp = origin
-        .checked_add_signed(interval_duration * num_intervals as i32)
+        .checked_add(interval_duration * num_intervals as i32)
         .unwrap_or(origin);
 
-    if diff.num_nanoseconds().unwrap_or(0) < 0 {
+    if duration_nanos(diff).unwrap_or(0) < 0 {
         nearest_timestamp = nearest_timestamp
-            .checked_sub_signed(interval_duration)
+            .checked_sub(interval_duration)
             .unwrap_or(origin);
     }
 
@@ -351,10 +354,7 @@ impl ScalarUDFImpl for DateBin {
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(Some(o), _tz)) => {
                 // The DF 42.2.0 upgrade added timezone values.  A comment about this in
                 // handle_year_month.
-                naive_datetime_from_timestamp_or_panic(
-                    *o / 1_000_000_000,
-                    (*o % 1_000_000_000) as u32,
-                )
+                utc_datetime_from_unix_nanos(*o)
             }
             ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(None, _)) => {
                 return Err(DataFusionError::Execution(format!(
@@ -373,7 +373,7 @@ impl ScalarUDFImpl for DateBin {
 
         fn handle_year_month(
             inputs: &[ColumnarValue],
-            origin: NaiveDateTime,
+            origin: DateTime,
             interval: i32,
         ) -> Result<ColumnarValue, DataFusionError> {
             match &inputs[1] {
@@ -388,7 +388,7 @@ impl ScalarUDFImpl for DateBin {
                     // use UTC time zone for all calculations, and remove the time zone from the
                     // return value.
                     Ok(ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(
-                        Some(timestamp_nanos_or_panic(&nearest_timestamp.and_utc())),
+                        Some(unix_nanos_from_utc_datetime_or_panic(nearest_timestamp)),
                         None,
                     )))
                 }
@@ -408,8 +408,8 @@ impl ScalarUDFImpl for DateBin {
                         } else {
                             let ts = ts_array.value(i);
                             let nearest_timestamp = calc_bin_timestamp_ym(origin, &ts, interval);
-                            builder.append_value(timestamp_nanos_or_panic(
-                                &nearest_timestamp.and_utc(),
+                            builder.append_value(unix_nanos_from_utc_datetime_or_panic(
+                                nearest_timestamp,
                             ));
                         }
                     }
@@ -426,7 +426,7 @@ impl ScalarUDFImpl for DateBin {
 
         fn handle_day_time(
             inputs: &[ColumnarValue],
-            origin: NaiveDateTime,
+            origin: DateTime,
             interval_days: i32,
             interval_nanos: i64,
         ) -> Result<ColumnarValue, DataFusionError> {
@@ -440,7 +440,7 @@ impl ScalarUDFImpl for DateBin {
                         calc_bin_timestamp_dt(origin, t, interval_days, interval_nanos);
 
                     Ok(ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(
-                        Some(timestamp_nanos_or_panic(&nearest_timestamp.and_utc())),
+                        Some(unix_nanos_from_utc_datetime_or_panic(nearest_timestamp)),
                         None,
                     )))
                 }
@@ -460,8 +460,8 @@ impl ScalarUDFImpl for DateBin {
                             let ts = ts_array.value(i);
                             let nearest_timestamp =
                                 calc_bin_timestamp_dt(origin, &ts, interval_days, interval_nanos);
-                            builder.append_value(timestamp_nanos_or_panic(
-                                &nearest_timestamp.and_utc(),
+                            builder.append_value(unix_nanos_from_utc_datetime_or_panic(
+                                nearest_timestamp,
                             ));
                         }
                     }

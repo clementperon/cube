@@ -27,7 +27,7 @@ pub struct MetaContext {
     pub compiler_id: Uuid,
     /// DateTime when MetaContext was created, but it can be used as last schema update when
     /// CompilerCache is used
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: jiff::Timestamp,
 }
 
 #[derive(Debug, Clone)]
@@ -143,7 +143,7 @@ impl MetaContext {
             data_source_to_sql_generator,
             external_pre_aggregation_members: vec![],
             compiler_id,
-            created_at: chrono::Utc::now(),
+            created_at: jiff::Timestamp::now(),
         }
     }
 

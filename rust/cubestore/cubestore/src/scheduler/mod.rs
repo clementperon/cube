@@ -20,11 +20,11 @@ use crate::util::lock::acquire_lock;
 use crate::util::time_span::warn_long_fut;
 use crate::util::WorkerLoop;
 use crate::CubeError;
-use chrono::Utc;
 use datafusion::cube_ext;
 use futures::future::join_all;
 use futures_timer::Delay;
 use itertools::Itertools;
+use jiff::Timestamp;
 use log::error;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -487,9 +487,9 @@ impl SchedulerImpl {
     /// can't remove failed one.
     pub async fn merge_replay_handles(&self) -> Result<(), CubeError> {
         fn is_newest_handle(handle: &IdRow<ReplayHandle>) -> bool {
-            Utc::now()
-                .signed_duration_since(handle.get_row().created_at().clone())
-                .num_seconds()
+            Timestamp::now()
+                .duration_since(handle.get_row().created_at().clone())
+                .as_secs()
                 < 60
         }
         let (failed, mut without_failed) = self
@@ -1167,7 +1167,7 @@ impl SchedulerImpl {
         if check_row_counts && chunk_sizes > self.config.compaction_chunks_total_size_threshold()
             || chunks.len() > self.config.compaction_chunks_count_threshold() as usize
             // Force compaction if other chunks were created far ago
-            || min_created_at.map(|min| Utc::now().signed_duration_since(min).num_seconds() > self.config.compaction_chunks_max_lifetime_threshold() as i64).unwrap_or(false)
+            || min_created_at.map(|min| Timestamp::now().duration_since(min).as_secs() > self.config.compaction_chunks_max_lifetime_threshold() as i64).unwrap_or(false)
         {
             self.schedule_partition_to_compact(partition).await?;
         }
@@ -1199,7 +1199,7 @@ impl SchedulerImpl {
         if chunks.len() > compaction_in_memory_chunks_count_threshold
             || oldest_insert_at
                 .map(|min| {
-                    Utc::now().signed_duration_since(min).num_seconds()
+                    Timestamp::now().duration_since(min).as_secs()
                         > self
                             .config
                             .compaction_in_memory_chunks_max_lifetime_threshold()

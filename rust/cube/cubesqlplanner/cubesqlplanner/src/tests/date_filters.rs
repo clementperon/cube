@@ -4,7 +4,8 @@ use indoc::indoc;
 
 fn create_context() -> TestContext {
     let schema = MockSchema::from_yaml_file("common/date_filters.yaml");
-    TestContext::new_with_timezone(schema, chrono_tz::America::Los_Angeles).unwrap()
+    let tz = jiff::tz::TimeZone::get("America/Los_Angeles").unwrap();
+    TestContext::new_with_timezone(schema, tz).unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]

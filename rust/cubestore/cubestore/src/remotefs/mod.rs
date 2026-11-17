@@ -9,11 +9,11 @@ use crate::di_service;
 use crate::util::lock::acquire_lock;
 use crate::CubeError;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use datafusion::cube_ext;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::FutureExt;
+use jiff::Timestamp;
 use log::debug;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -26,7 +26,7 @@ use tokio::sync::{Mutex, RwLock};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteFile {
     pub remote_path: String,
-    pub updated: DateTime<Utc>,
+    pub updated: Timestamp,
     pub file_size: u64,
 }
 
@@ -35,7 +35,7 @@ impl RemoteFile {
         self.remote_path.as_str()
     }
 
-    pub fn updated(&self) -> &DateTime<Utc> {
+    pub fn updated(&self) -> &Timestamp {
         &self.updated
     }
 }
@@ -489,7 +489,7 @@ impl LocalDirRemoteFs {
                     if relative_name.starts_with(&remote_prefix) {
                         result_builder.push(RemoteFile {
                             remote_path: relative_name.to_string(),
-                            updated: DateTime::from(metadata.modified()?),
+                            updated: Timestamp::try_from(metadata.modified()?)?,
                             file_size: metadata.len(),
                         });
                     }

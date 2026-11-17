@@ -1,8 +1,8 @@
 use async_trait::async_trait;
-use chrono::{DateTime, SecondsFormat, Utc};
 use cubeclient::apis::{
     configuration::Configuration as ClientConfiguration, default_api as cube_api,
 };
+use jiff::Timestamp;
 
 use datafusion::{
     arrow::{
@@ -111,7 +111,7 @@ pub struct SpanId {
     pub redacted_query_key: Option<serde_json::Value>,
     span_start: SystemTime,
     is_data_query: RWLockAsync<bool>,
-    last_refresh_time: RWLockAsync<Option<DateTime<Utc>>>,
+    last_refresh_time: RWLockAsync<Option<Timestamp>>,
     external: RWLockAsync<Option<bool>>,
     used_pre_aggregations: RWLockAsync<serde_json::Map<String, serde_json::Value>>,
 }
@@ -151,7 +151,7 @@ impl SpanId {
     /// Records the refresh time of a load result contributing to this span.
     /// A span may cover several load requests (e.g. a join of cube scans);
     /// the oldest value wins, matching `lastRefreshTime` semantics elsewhere.
-    pub async fn set_last_refresh_time(&self, last_refresh_time: DateTime<Utc>) {
+    pub async fn set_last_refresh_time(&self, last_refresh_time: Timestamp) {
         let mut write = self.last_refresh_time.write().await;
         *write = Some(match *write {
             Some(current) => current.min(last_refresh_time),
@@ -161,7 +161,7 @@ impl SpanId {
 
     pub async fn last_refresh_time(&self) -> Option<String> {
         let read = self.last_refresh_time.read().await;
-        read.map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true))
+        read.map(|t| t.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
     }
 
     /// Records whether a load result contributing to this span was served from
@@ -1246,7 +1246,6 @@ impl SqlTemplates {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     fn sql_templates_with(entries: Vec<(&str, &str)>) -> SqlTemplates {
         let templates = entries
@@ -1299,8 +1298,8 @@ mod tests {
         let span_id = SpanId::new("test".to_string(), serde_json::json!({}));
         assert_eq!(span_id.last_refresh_time().await, None);
 
-        let newer = Utc.with_ymd_and_hms(2024, 6, 1, 12, 0, 0).unwrap();
-        let older = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let newer: Timestamp = "2024-06-01T12:00:00Z".parse().unwrap();
+        let older: Timestamp = "2024-01-01T00:00:00Z".parse().unwrap();
 
         span_id.set_last_refresh_time(newer).await;
         assert_eq!(

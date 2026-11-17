@@ -8,11 +8,10 @@ use crate::queryplanner::udfs::CubeAggregateUDFKind;
 use crate::rocks_table_impl;
 use crate::{base_rocks_secondary_index, CubeError};
 use byteorder::{BigEndian, WriteBytesExt};
-use chrono::DateTime;
-use chrono::Utc;
 use datafusion::arrow::datatypes::Schema as ArrowSchema;
 use datafusion::physical_plan::expressions::Column as FusionColumn;
 use itertools::Itertools;
+use jiff::Timestamp;
 
 use datafusion::functions_aggregate::min_max::{Max, Min};
 use datafusion::functions_aggregate::sum::Sum;
@@ -142,11 +141,11 @@ pub struct Table {
     #[serde(default="Table::is_ready_default")]
     is_ready: bool,
     #[serde(default)]
-    created_at: Option<DateTime<Utc>>,
+    created_at: Option<Timestamp>,
     #[serde(default)]
-    build_range_end: Option<DateTime<Utc>>,
+    build_range_end: Option<Timestamp>,
     #[serde(default)]
-    seal_at: Option<DateTime<Utc>>,
+    seal_at: Option<Timestamp>,
     #[serde(default)]
     sealed: bool,
     #[serde(default)]
@@ -207,8 +206,8 @@ impl Table {
         locations: Option<Vec<String>>,
         import_format: Option<ImportFormat>,
         is_ready: bool,
-        build_range_end: Option<DateTime<Utc>>,
-        seal_at: Option<DateTime<Utc>>,
+        build_range_end: Option<Timestamp>,
+        seal_at: Option<Timestamp>,
         select_statement: Option<String>,
         source_columns: Option<Vec<Column>>,
         stream_offset: Option<StreamOffset>,
@@ -227,7 +226,7 @@ impl Table {
             import_format,
             has_data: false,
             is_ready,
-            created_at: Some(Utc::now()),
+            created_at: Some(Timestamp::now()),
             build_range_end,
             seal_at,
             select_statement,
@@ -324,15 +323,15 @@ impl Table {
         true
     }
 
-    pub fn created_at(&self) -> &Option<DateTime<Utc>> {
+    pub fn created_at(&self) -> &Option<Timestamp> {
         &self.created_at
     }
 
-    pub fn build_range_end(&self) -> &Option<DateTime<Utc>> {
+    pub fn build_range_end(&self) -> &Option<Timestamp> {
         &self.build_range_end
     }
 
-    pub fn seal_at(&self) -> &Option<DateTime<Utc>> {
+    pub fn seal_at(&self) -> &Option<Timestamp> {
         &self.seal_at
     }
 

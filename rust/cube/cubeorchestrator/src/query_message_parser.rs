@@ -17,6 +17,8 @@ use cubeshared::codegen::{
 };
 use cubeshared::flatbuffers::VerifierOptions;
 use indexmap::IndexMap;
+use jiff::tz::TimeZone;
+use jiff::Timestamp;
 use neon::prelude::Finalize;
 use std::io::Cursor;
 
@@ -406,16 +408,20 @@ fn append_arrow_array(
         }};
     }
 
+    // `$to_timestamp` reads the raw value in the unit of `$ty`; a value outside the supported
+    // range of dates becomes `Null`.
     macro_rules! push_datetime {
-        ($ty:ty) => {{
+        ($ty:ty, $to_timestamp:expr) => {{
             let a = downcast_array_ref!($ty);
             for i in 0..len {
                 if a.is_null(i) {
                     col.push(DBResponsePrimitive::Null);
                 } else {
-                    match a.value_as_datetime(i) {
-                        Some(dt) => col.push(DBResponsePrimitive::Timestamp(dt)),
-                        None => col.push(DBResponsePrimitive::Null),
+                    match $to_timestamp(a.value(i)) {
+                        Ok(ts) => col.push(DBResponsePrimitive::Timestamp(
+                            TimeZone::UTC.to_datetime(ts),
+                        )),
+                        Err(_) => col.push(DBResponsePrimitive::Null),
                     }
                 }
             }
@@ -500,12 +506,24 @@ fn append_arrow_array(
         DataType::LargeBinary => push_binary!(LargeBinaryArray),
         DataType::BinaryView => push_binary!(BinaryViewArray),
         DataType::FixedSizeBinary(_) => push_binary!(FixedSizeBinaryArray),
-        DataType::Date32 => push_datetime!(Date32Array),
-        DataType::Date64 => push_datetime!(Date64Array),
-        DataType::Timestamp(TimeUnit::Second, _) => push_datetime!(TimestampSecondArray),
-        DataType::Timestamp(TimeUnit::Millisecond, _) => push_datetime!(TimestampMillisecondArray),
-        DataType::Timestamp(TimeUnit::Microsecond, _) => push_datetime!(TimestampMicrosecondArray),
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => push_datetime!(TimestampNanosecondArray),
+        DataType::Date32 => push_datetime!(Date32Array, |days| Timestamp::from_second(
+            i64::from(days) * 86_400
+        )),
+        DataType::Date64 => push_datetime!(Date64Array, Timestamp::from_millisecond),
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            push_datetime!(TimestampSecondArray, Timestamp::from_second)
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            push_datetime!(TimestampMillisecondArray, Timestamp::from_millisecond)
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            push_datetime!(TimestampMicrosecondArray, Timestamp::from_microsecond)
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            push_datetime!(TimestampNanosecondArray, |ns| Timestamp::from_nanosecond(
+                i128::from(ns)
+            ))
+        }
         DataType::Decimal128(_, _) => push_decimal!(Decimal128Array),
         DataType::Decimal256(_, _) => push_decimal!(Decimal256Array),
         other => return Err(ParseError::UnsupportedArrowType(format!("{other:?}"))),

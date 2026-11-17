@@ -20,9 +20,12 @@ use crate::{
         SqlTemplates, TransportLoadRequestQuery, TransportService, V1CubeMetaExt,
         CUBE_STORE_DATA_SOURCE,
     },
+    utils::datetime::{
+        date_from_unix_days, datetime_from_unix_micros, datetime_from_unix_millis,
+        datetime_from_unix_nanos, datetime_from_unix_seconds,
+    },
     CubeError,
 };
-use chrono::{Days, NaiveDate, SecondsFormat, TimeZone, Utc};
 use cubeclient::models::{V1LoadRequestQuery, V1LoadRequestQueryJoinSubquery};
 use datafusion::logical_plan::{ExprVisitable, ExpressionVisitor, Recursion};
 use datafusion::{
@@ -934,10 +937,17 @@ impl ExprRewriter for IntDivisionRewriter<'_> {
     }
 }
 
+/// `$to_datetime` turns the literal's `i64` into its UTC `Option<DateTime>`.
 macro_rules! generate_sql_for_timestamp {
-    (@generic $literal:ident, $value:ident, $value_block:expr, $sql_generator:expr, $sql_query:expr) => {
+    ($literal:ident, $value:ident, $to_datetime:expr, $sql_generator:expr, $sql_query:expr) => {
         if let Some($value) = $value {
-            let value = $value_block.to_rfc3339_opts(SecondsFormat::Millis, true);
+            let Some(datetime) = $to_datetime($value) else {
+                return Err(DataFusionError::Internal(format!(
+                    "Can't generate SQL for timestamp: value out of bounds ({})",
+                    $value
+                )));
+            };
+            let value = datetime.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
             (
                 $sql_generator
                     .get_sql_templates()
@@ -951,28 +961,11 @@ macro_rules! generate_sql_for_timestamp {
                 $sql_query,
             )
         } else {
-            (Self::generate_null_for_literal($sql_generator, &$literal)?, $sql_query)
+            (
+                Self::generate_null_for_literal($sql_generator, &$literal)?,
+                $sql_query,
+            )
         }
-    };
-    ($literal:ident, $value:ident, timestamp, $sql_generator:expr, $sql_query:expr) => {
-        generate_sql_for_timestamp!(
-            @generic $literal, $value, { Utc.timestamp_opt($value as i64, 0).unwrap() }, $sql_generator, $sql_query
-        )
-    };
-    ($literal:ident, $value:ident, timestamp_millis_opt, $sql_generator:expr, $sql_query:expr) => {
-        generate_sql_for_timestamp!(
-            @generic $literal, $value, { Utc.timestamp_millis_opt($value as i64).unwrap() }, $sql_generator, $sql_query
-        )
-    };
-    ($literal:ident, $value:ident, timestamp_micros, $sql_generator:expr, $sql_query:expr) => {
-        generate_sql_for_timestamp!(
-            @generic $literal, $value, { Utc.timestamp_micros($value as i64).unwrap() }, $sql_generator, $sql_query
-        )
-    };
-    ($literal:ident, $value:ident, $method:ident, $sql_generator:expr, $sql_query:expr) => {
-        generate_sql_for_timestamp!(
-            @generic $literal, $value, { Utc.$method($value as i64) }, $sql_generator, $sql_query
-        )
     };
 }
 
@@ -3815,20 +3808,13 @@ impl WrappedSelectNode {
             // ScalarValue::List(_, _) => {}
             ScalarValue::Date32(x) => {
                 if let Some(x) = x {
-                    let days = Days::new(x.abs().try_into().unwrap());
-                    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                    let new_date = if x < 0 {
-                        epoch.checked_sub_days(days)
-                    } else {
-                        epoch.checked_add_days(days)
-                    };
-                    let Some(new_date) = new_date else {
+                    let Some(new_date) = date_from_unix_days(x) else {
                         return Err(DataFusionError::Internal(format!(
                             "Can't generate SQL for date: day out of bounds ({})",
                             x
                         )));
                     };
-                    let formatted_date = new_date.format("%Y-%m-%d").to_string();
+                    let formatted_date = new_date.strftime("%Y-%m-%d").to_string();
                     (
                         sql_generator
                             .get_sql_templates()
@@ -3855,12 +3841,18 @@ impl WrappedSelectNode {
             }
             // ScalarValue::Date64(_) => {}
 
-            // generate_sql_for_timestamp will call Utc constructors, so only support UTC zone for now
+            // generate_sql_for_timestamp renders the value in UTC, so only support UTC zone for now
             // DataFusion can return "UTC" for stuff like `NOW()` during constant folding
             ScalarValue::TimestampSecond(s, ref tz)
                 if matches!(tz.as_deref(), None | Some("UTC")) =>
             {
-                generate_sql_for_timestamp!(literal, s, timestamp, sql_generator, sql_query)
+                generate_sql_for_timestamp!(
+                    literal,
+                    s,
+                    datetime_from_unix_seconds,
+                    sql_generator,
+                    sql_query
+                )
             }
             ScalarValue::TimestampMillisecond(ms, ref tz)
                 if matches!(tz.as_deref(), None | Some("UTC")) =>
@@ -3868,7 +3860,7 @@ impl WrappedSelectNode {
                 generate_sql_for_timestamp!(
                     literal,
                     ms,
-                    timestamp_millis_opt,
+                    datetime_from_unix_millis,
                     sql_generator,
                     sql_query
                 )
@@ -3876,7 +3868,13 @@ impl WrappedSelectNode {
             ScalarValue::TimestampMicrosecond(ms, ref tz)
                 if matches!(tz.as_deref(), None | Some("UTC")) =>
             {
-                generate_sql_for_timestamp!(literal, ms, timestamp_micros, sql_generator, sql_query)
+                generate_sql_for_timestamp!(
+                    literal,
+                    ms,
+                    datetime_from_unix_micros,
+                    sql_generator,
+                    sql_query
+                )
             }
             ScalarValue::TimestampNanosecond(nanoseconds, ref tz)
                 if matches!(tz.as_deref(), None | Some("UTC")) =>
@@ -3884,7 +3882,7 @@ impl WrappedSelectNode {
                 generate_sql_for_timestamp!(
                     literal,
                     nanoseconds,
-                    timestamp_nanos,
+                    |nanos| Some(datetime_from_unix_nanos(nanos)),
                     sql_generator,
                     sql_query
                 )

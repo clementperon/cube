@@ -1,20 +1,27 @@
-use std::{env, pin::pin, time::Duration};
+use std::{convert::TryInto, env, pin::pin, time::Duration};
 
 use async_trait::async_trait;
 use comfy_table::{Cell as TableCell, Table};
-use cubesql::config::Config;
+use cubesql::{config::Config, utils::datetime::SqlDateTime};
 use futures::TryStreamExt;
 use portpicker::{pick_unused_port, Port};
 use rust_decimal::prelude::*;
 use tokio::time::sleep;
 
 use super::utils::escape_snapshot_name;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use datafusion::assert_contains;
+use jiff::{
+    civil::{Date, DateTime},
+    SignedDuration,
+};
 use pg_interval::Interval;
 use pg_srv::{PgType, PgTypeId};
 use tokio::join;
-use tokio_postgres::{error::SqlState, Client, NoTls, Row, SimpleQueryMessage};
+use tokio_postgres::{
+    error::SqlState,
+    types::{FromSql, Type},
+    Client, NoTls, Row, SimpleQueryMessage,
+};
 
 use super::basic::{AsyncTestConstructorResult, AsyncTestSuite, RunResult};
 
@@ -24,6 +31,43 @@ pub struct PostgresIntegrationTestSuite {
     port: Port,
     // connection: tokio_postgres::Connection<Socket, NoTlsStream>,
 }
+
+/// A `DATE` in its binary form: days since 2000-01-01.
+struct PgDate(Date);
+
+impl<'a> FromSql<'a> for PgDate {
+    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let days = i32::from_be_bytes(raw.try_into()?);
+        let date = PG_EPOCH
+            .date()
+            .checked_add(SignedDuration::from_hours(i64::from(days) * 24))?;
+        Ok(PgDate(date))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::DATE
+    }
+}
+
+/// A `TIMESTAMP` or `TIMESTAMPTZ` in its binary form: microseconds since 2000-01-01, in UTC
+/// for the latter.
+struct PgTimestamp(DateTime);
+
+impl<'a> FromSql<'a> for PgTimestamp {
+    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let micros = i64::from_be_bytes(raw.try_into()?);
+        Ok(PgTimestamp(
+            PG_EPOCH.checked_add(SignedDuration::from_micros(micros))?,
+        ))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::TIMESTAMP | Type::TIMESTAMPTZ)
+    }
+}
+
+/// The epoch PostgreSQL counts dates and timestamps from.
+const PG_EPOCH: DateTime = DateTime::constant(2000, 1, 1, 0, 0, 0, 0);
 
 fn get_env_var(env_name: &'static str) -> Option<String> {
     if let Ok(value) = env::var(env_name) {
@@ -195,20 +239,28 @@ impl PostgresIntegrationTestSuite {
                         values.push(value.map(|v| v.to_string()).unwrap_or("NULL".to_string()));
                     }
                     PgTypeId::DATE => {
-                        let value: Option<NaiveDate> = row.get(idx);
-                        values.push(value.map(|v| v.to_string()).unwrap_or("NULL".to_string()));
+                        let value: Option<PgDate> = row.get(idx);
+                        values.push(value.map(|v| v.0.to_string()).unwrap_or("NULL".to_string()));
                     }
                     PgTypeId::INTERVAL => {
                         let value: Option<Interval> = row.get(idx);
                         values.push(value.map(|v| v.to_postgres()).unwrap_or("NULL".to_string()));
                     }
                     PgTypeId::TIMESTAMP => {
-                        let value: Option<NaiveDateTime> = row.get(idx);
-                        values.push(value.map(|v| v.to_string()).unwrap_or("NULL".to_string()));
+                        let value: Option<PgTimestamp> = row.get(idx);
+                        values.push(
+                            value
+                                .map(|v| SqlDateTime(v.0).to_string())
+                                .unwrap_or("NULL".to_string()),
+                        );
                     }
                     PgTypeId::TIMESTAMPTZ => {
-                        let value: Option<DateTime<Utc>> = row.get(idx);
-                        values.push(value.map(|v| v.to_string()).unwrap_or("NULL".to_string()));
+                        let value: Option<PgTimestamp> = row.get(idx);
+                        values.push(
+                            value
+                                .map(|v| format!("{} UTC", SqlDateTime(v.0)))
+                                .unwrap_or("NULL".to_string()),
+                        );
                     }
                     PgTypeId::NUMERIC => {
                         let value: Option<Decimal> = row.get(idx);

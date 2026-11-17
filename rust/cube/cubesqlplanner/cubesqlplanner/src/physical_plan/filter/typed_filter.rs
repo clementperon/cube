@@ -11,8 +11,8 @@ use crate::planner::sql_call::SqlCallFilterParamsItem;
 use crate::planner::sql_templates::PlanSqlTemplates;
 use crate::planner::FiltersContext;
 use crate::planner::SqlInterval;
-use chrono_tz::Tz;
 use cubenativeutils::CubeError;
+use jiff::tz::TimeZone;
 use std::rc::Rc;
 
 impl ToSql for TypedFilter {
@@ -230,7 +230,7 @@ impl TypedFilter {
     fn rolling_window_band(
         &self,
         ctx: &FilterSqlContext,
-        tz: Tz,
+        tz: &TimeZone,
     ) -> Result<Option<(String, String)>, CubeError> {
         let band = self
             .operation()
@@ -267,7 +267,7 @@ mod tests {
 
     fn shifted(date: &str, interval: &str, subtract: bool) -> String {
         shift_bound_wall_clock(
-            Tz::America__Los_Angeles,
+            &TimeZone::get("America/Los_Angeles").unwrap(),
             date,
             &Some(interval.to_string()),
             subtract,
@@ -318,7 +318,7 @@ mod tests {
     fn an_unbounded_side_states_no_bound() {
         assert_eq!(
             shift_bound_wall_clock(
-                Tz::America__Los_Angeles,
+                &TimeZone::get("America/Los_Angeles").unwrap(),
                 "2024-03-10T12:00:00.000",
                 &Some("unbounded".to_string()),
                 true

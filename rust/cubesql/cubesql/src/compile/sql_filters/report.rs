@@ -16,9 +16,9 @@ use crate::{
     transport::MetaContext,
     CubeError,
 };
-use chrono::{Duration, NaiveDateTime};
 use cubeclient::models::V1LoadRequestQueryFilterItem;
 use datafusion::logical_plan::{LogicalPlan, PlanVisitor};
+use jiff::{civil::DateTime, SignedDuration};
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -380,8 +380,8 @@ pub(super) fn bound_folded_into_range(
     reported: &[V1LoadRequestQueryFilterItem],
 ) -> bool {
     enum RangeEnd {
-        Start(NaiveDateTime),
-        Stop(NaiveDateTime),
+        Start(DateTime),
+        Stop(DateTime),
     }
 
     let (Some(member), Some(operator), Some([value])) = (
@@ -394,17 +394,17 @@ pub(super) fn bound_folded_into_range(
     let Some(at) = instant(value, false) else {
         return false;
     };
-    let millisecond = Duration::milliseconds(1);
+    let millisecond = SignedDuration::from_millis(1);
     let end = match operator {
         "afterOrOnDate" => RangeEnd::Start(at),
         "beforeOrOnDate" => RangeEnd::Stop(at),
-        "afterDate" => match at.checked_add_signed(millisecond) {
-            Some(at) => RangeEnd::Start(at),
-            None => return false,
+        "afterDate" => match at.checked_add(millisecond) {
+            Ok(at) => RangeEnd::Start(at),
+            Err(_) => return false,
         },
-        "beforeDate" => match at.checked_sub_signed(millisecond) {
-            Some(at) => RangeEnd::Stop(at),
-            None => return false,
+        "beforeDate" => match at.checked_sub(millisecond) {
+            Ok(at) => RangeEnd::Stop(at),
+            Err(_) => return false,
         },
         _ => return false,
     };
@@ -426,10 +426,12 @@ pub(super) fn bound_folded_into_range(
 
 /// The instant a value stands for: a bare date is the start of its day, or its
 /// last millisecond as a range's upper bound.
-fn instant(value: &str, range_upper: bool) -> Option<NaiveDateTime> {
+fn instant(value: &str, range_upper: bool) -> Option<DateTime> {
     let at = parse_date_str(value).ok()?;
     if range_upper && is_iso_date_like(value) && value.len() == DATE_LENGTH {
-        return at.checked_add_signed(Duration::days(1) - Duration::milliseconds(1));
+        return at
+            .checked_add(SignedDuration::from_hours(24) - SignedDuration::from_millis(1))
+            .ok();
     }
     Some(at)
 }

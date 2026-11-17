@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use cloud_storage::Object;
 use datafusion::cube_ext;
 use futures::StreamExt;
+use jiff::Timestamp;
 use log::{debug, info};
 use regex::{NoExpand, Regex};
 use std::path::{Path, PathBuf};
@@ -297,12 +298,16 @@ impl RemoteFs for GCSRemoteFs {
         remote_prefix: String,
     ) -> Result<Vec<RemoteFile>, CubeError> {
         let leading_subpath = self.leading_subpath_regex();
-        self.list_with_metadata_and_map(remote_prefix, |obj: Object| RemoteFile {
-            remote_path: Self::object_key_to_remote_path(&leading_subpath, &obj.name),
-            updated: obj.updated,
-            file_size: obj.size,
+        self.list_with_metadata_and_map(remote_prefix, |obj: Object| {
+            Ok(RemoteFile {
+                remote_path: Self::object_key_to_remote_path(&leading_subpath, &obj.name),
+                updated: Self::object_updated(&obj)?,
+                file_size: obj.size,
+            })
         })
-        .await
+        .await?
+        .into_iter()
+        .collect()
     }
 
     async fn local_path(&self) -> Result<String, CubeError> {
@@ -363,6 +368,14 @@ impl GCSRemoteFs {
             ]),
         );
         Ok(result)
+    }
+
+    /// `cloud-storage` reports object times as chrono values. Convert right at the boundary,
+    /// through the Unix time, so the rest of the crate only deals with jiff.
+    fn object_updated(obj: &Object) -> Result<Timestamp, CubeError> {
+        let nanos = i128::from(obj.updated.timestamp()) * 1_000_000_000
+            + i128::from(obj.updated.timestamp_subsec_nanos());
+        Ok(Timestamp::from_nanosecond(nanos)?)
     }
 
     fn gcs_path(&self, remote_path: &str) -> String {

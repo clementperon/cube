@@ -12,6 +12,8 @@ pub mod schema;
 pub mod snapshot_info;
 pub mod source;
 pub mod table;
+#[cfg(test)]
+mod timestamp_compat_tests;
 pub mod trace_object;
 pub mod wal;
 
@@ -57,10 +59,10 @@ use crate::metastore::wal::{WALIndexKey, WALRocksIndex};
 use crate::table::{Row, TableValue};
 
 use crate::util::lock::{acquire_lock, acquire_lock_duration};
+use crate::util::time::to_utc_string;
 use crate::util::WorkerLoop;
 use crate::{meta_store_table_impl, CubeError};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use chrono::{DateTime, Utc};
 use chunks::ChunkRocksTable;
 use core::fmt;
 use cubehll::HllSketch;
@@ -74,6 +76,7 @@ use datafusion::parquet::{basic::Type, schema::types};
 use futures_timer::Delay;
 use index::{IndexRocksIndex, IndexRocksTable};
 use itertools::Itertools;
+use jiff::{SignedDuration, Timestamp};
 use log::trace;
 use multi_index::{MultiIndex, MultiIndexRocksIndex, MultiIndexRocksTable};
 use partition::{PartitionRocksIndex, PartitionRocksTable};
@@ -180,7 +183,7 @@ macro_rules! base_rocks_secondary_index {
                 RocksSecondaryIndex::store_ttl_extended_info(self)
             }
 
-            fn get_expire(&self, row: &$table) -> Option<chrono::DateTime<chrono::Utc>> {
+            fn get_expire(&self, row: &$table) -> Option<jiff::Timestamp> {
                 RocksSecondaryIndex::get_expire(self, row)
             }
 
@@ -249,17 +252,17 @@ impl DataFrameValue<String> for Option<Vec<String>> {
     }
 }
 
-impl DataFrameValue<String> for Option<DateTime<Utc>> {
+impl DataFrameValue<String> for Option<Timestamp> {
     fn value(v: &Self) -> String {
         v.as_ref()
-            .map(|s| s.to_string())
+            .map(|s| to_utc_string(*s))
             .unwrap_or("NULL".to_string())
     }
 }
 
-impl DataFrameValue<String> for DateTime<Utc> {
+impl DataFrameValue<String> for Timestamp {
     fn value(v: &Self) -> String {
-        v.to_string()
+        to_utc_string(*v)
     }
 }
 
@@ -739,7 +742,7 @@ pub struct Partition {
     main_table_row_count: u64,
     /// Not used or updated anymore.
     #[serde(default)]
-    last_used: Option<DateTime<Utc>>,
+    last_used: Option<Timestamp>,
     #[serde(default)]
     suffix: Option<String>,
     #[serde(default)]
@@ -762,15 +765,15 @@ pub struct Chunk {
     active: bool,
     /// Not used or updated anymore.
     #[serde(default)]
-    last_used: Option<DateTime<Utc>>,
+    last_used: Option<Timestamp>,
     #[serde(default)]
     in_memory: bool,
     #[serde(default)]
-    created_at: Option<DateTime<Utc>>,
+    created_at: Option<Timestamp>,
     #[serde(default)]
-    oldest_insert_at: Option<DateTime<Utc>>,
+    oldest_insert_at: Option<Timestamp>,
     #[serde(default)]
-    deactivated_at: Option<DateTime<Utc>>,
+    deactivated_at: Option<Timestamp>,
     #[serde(default)]
     suffix: Option<String>,
     #[serde(default)]
@@ -845,8 +848,8 @@ pub trait MetaStore: DIService + Send + Sync {
         import_format: Option<ImportFormat>,
         indexes: Vec<IndexDef>,
         is_ready: bool,
-        build_range_end: Option<DateTime<Utc>>,
-        seal_at: Option<DateTime<Utc>>,
+        build_range_end: Option<Timestamp>,
+        seal_at: Option<Timestamp>,
         select_statement: Option<String>,
         source_coulumns: Option<Vec<Column>>,
         stream_offset: Option<StreamOffset>,
@@ -1086,7 +1089,7 @@ pub trait MetaStore: DIService + Send + Sync {
     async fn chunk_update_last_inserted(
         &self,
         chunk_ids: Vec<u64>,
-        last_inserted_at: Option<DateTime<Utc>>,
+        last_inserted_at: Option<Timestamp>,
     ) -> Result<(), CubeError>;
     async fn deactivate_chunk(&self, chunk_id: u64) -> Result<(), CubeError>;
     async fn deactivate_chunks(&self, chunk_ids: Vec<u64>) -> Result<(), CubeError>;
@@ -2330,8 +2333,8 @@ impl MetaStore for RocksMetaStore {
         import_format: Option<ImportFormat>,
         indexes: Vec<IndexDef>,
         is_ready: bool,
-        build_range_end: Option<DateTime<Utc>>,
-        seal_at: Option<DateTime<Utc>>,
+        build_range_end: Option<Timestamp>,
+        seal_at: Option<Timestamp>,
         select_statement: Option<String>,
         source_coulumns: Option<Vec<Column>>,
         stream_offset: Option<StreamOffset>,
@@ -2722,7 +2725,7 @@ impl MetaStore for RocksMetaStore {
             let table_rocks_table = TableRocksTable::new(db_ref);
             let tables = table_rocks_table.scan_all_rows()?;
             let mut res = Vec::new();
-            let now = Utc::now();
+            let now = Timestamp::now();
             for table in tables {
                 let table = table?;
                 if !table.get_row().is_ready()
@@ -2731,8 +2734,7 @@ impl MetaStore for RocksMetaStore {
                         .created_at()
                         .as_ref()
                         .map(|created_at| {
-                            now.signed_duration_since(created_at.clone()).num_seconds()
-                                >= created_seconds_ago
+                            now.duration_since(created_at.clone()).as_secs() >= created_seconds_ago
                         })
                         .unwrap_or(false)
                 {
@@ -3353,7 +3355,7 @@ impl MetaStore for RocksMetaStore {
             move |db_ref| {
                 let chunks_table = ChunkRocksTable::new(db_ref.clone());
 
-                let now = Utc::now();
+                let now = Timestamp::now();
                 let mut partition_ids = HashSet::new();
                 for c in chunks_table.scan_all_rows()? {
                     let c = c?;
@@ -3362,8 +3364,7 @@ impl MetaStore for RocksMetaStore {
                             .created_at()
                             .as_ref()
                             .map(|created_at| {
-                                now.signed_duration_since(created_at.clone()).num_seconds()
-                                    >= seconds_ago
+                                now.duration_since(created_at.clone()).as_secs() >= seconds_ago
                             })
                             .unwrap_or(false)
                     {
@@ -3496,7 +3497,7 @@ impl MetaStore for RocksMetaStore {
             move |db_ref| {
                 let chunks_table = ChunkRocksTable::new(db_ref.clone());
 
-                let now = Utc::now();
+                let now = Timestamp::now();
                 let mut partitions = HashMap::new();
                 for c in chunks_table.scan_all_rows()? {
                     let c = c?;
@@ -3505,8 +3506,7 @@ impl MetaStore for RocksMetaStore {
                             .created_at()
                             .as_ref()
                             .map(|created_at| {
-                                now.signed_duration_since(created_at.clone()).num_seconds()
-                                    >= seconds_ago
+                                now.duration_since(created_at.clone()).as_secs() >= seconds_ago
                             })
                             .unwrap_or(false)
                     {
@@ -3986,7 +3986,7 @@ impl MetaStore for RocksMetaStore {
     async fn chunk_update_last_inserted(
         &self,
         chunk_ids: Vec<u64>,
-        last_inserted_at: Option<DateTime<Utc>>,
+        last_inserted_at: Option<Timestamp>,
     ) -> Result<(), CubeError> {
         self.write_operation("chunk_update_last_inserted", move |db_ref, batch_pipe| {
             let table = ChunkRocksTable::new(db_ref.clone());
@@ -4360,10 +4360,10 @@ impl MetaStore for RocksMetaStore {
         &self,
         orphaned_timeout: Duration,
     ) -> Result<Vec<IdRow<Job>>, CubeError> {
-        let duration = chrono::Duration::from_std(orphaned_timeout).unwrap();
+        let duration = SignedDuration::try_from(orphaned_timeout).unwrap();
         self.read_operation_out_of_queue("get_orphaned_jobs", move |db_ref| {
             let jobs_table = JobRocksTable::new(db_ref);
-            let time = Utc::now();
+            let time = Timestamp::now();
             let all_jobs = jobs_table
                 .all_rows()?
                 .into_iter()
@@ -4371,8 +4371,7 @@ impl MetaStore for RocksMetaStore {
                     if let JobStatus::Scheduled(_) = j.get_row().status() {
                         return false;
                     }
-                    let duration1 =
-                        time.signed_duration_since(j.get_row().last_heart_beat().clone());
+                    let duration1 = time.duration_since(j.get_row().last_heart_beat().clone());
                     duration1 > duration
                 })
                 .collect::<Vec<_>>();
@@ -5498,7 +5497,7 @@ mod tests {
 
     #[test]
     fn test_structures_size() {
-        assert_eq!(std::mem::size_of::<MetaStoreEvent>(), 640);
+        assert_eq!(std::mem::size_of::<MetaStoreEvent>(), 720);
     }
 
     #[tokio::test]
